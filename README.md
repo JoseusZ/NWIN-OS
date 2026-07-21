@@ -454,9 +454,11 @@ artefacts in the project archive.
 
 ### License and Sign-off
 
-NWIN OS is released under the **MIT License**. By sending a patch
-you agree to license your contribution under the same terms. Add a
-`Signed-off-by:` line to your commit message to certify the
+NWIN OS is released under the **GNU General Public License v3**
+(GPLv3). See the [`LICENSE`](LICENSE) file for the full text. By
+sending a patch you agree to license your contribution under the
+same terms. Add a `Signed-off-by:` line to your commit message to
+certify the
 [Developer Certificate of Origin 1.1](https://developercertificate.org/).
 
 ---
@@ -723,9 +725,11 @@ fusionados a master.
 
 ### Licencia y Sign-off
 
-NWIN OS se distribuye bajo la **Licencia MIT**. Al enviar un parche
-aceptas licenciarlo bajo los mismos terminos. Agrega una linea
-`Signed-off-by:` a tu commit para certificar el
+NWIN OS se distribuye bajo la **GNU General Public License v3**
+(GPLv3). Consulta el archivo [`LICENSE`](LICENSE) para ver el texto
+completo. Al enviar un parche aceptas licenciarlo bajo los mismos
+terminos. Agrega una linea `Signed-off-by:` a tu commit para
+certificar el
 [Developer Certificate of Origin 1.1](https://developercertificate.org/).
 
 ---
