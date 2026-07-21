@@ -1,0 +1,9 @@
+/target
+# Logs volatiles generados por QEMU y serial
+/*.log
+# Configuracion local del editor
+/.vscode/
+# Imagenes de disco de prueba (regenerables, ver tests/disk-images/README.md)
+/tests/disk-images/*.img
+# Backups accidentales del editor
+*.rs.bk

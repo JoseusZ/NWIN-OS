@@ -1,0 +1,40 @@
+[package]
+name = "nwin_os"
+version = "0.1.0"
+edition = "2021"
+
+# Dependencias
+[dependencies]
+limine = "0.6.3"
+x86_64 = "0.14.12"
+lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
+spin = "0.9.8"
+font8x8 = { version = "0.3.1", default-features = false, features = ["unicode"] }
+linked_list_allocator = "0.10.5"
+pic8259 = "0.10.1"
+crossbeam-queue = { version = "0.3.8", default-features = false, features = ["alloc"] }
+pc-keyboard = "0.7.0"
+bitflags = "2.13.0"
+
+
+# Perfil para desarrollo rápido (cuando pruebes en QEMU)
+[profile.dev]
+panic = "abort"
+
+[profile.test]
+panic = "abort"
+
+# Perfil súper optimizado para cuando compiles la versión final
+[profile.release]
+panic = "abort"
+opt-level = "z"      # Optimizar para tamaño de binario mínimo
+lto = true           # Link Time Optimization (analiza todo el código de golpe)
+codegen-units = 1    # Compila todo en un solo hilo (más lento, pero mejor optimizado)
+
+[[bin]]
+name = "NWIN_OS"
+path = "src/main.rs"
+harness = false
+
+[build]
+target = "x86_64-unknown-none"
