@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 NWIN OS
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
 use x86_64::registers::model_specific::Msr;
 

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 NWIN OS
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 use core::sync::atomic::Ordering;
 use crate::task::{context_switch, PrivilegeLevel, TaskId, TaskState, TASK_MANAGER};
 use x86_64::VirtAddr;

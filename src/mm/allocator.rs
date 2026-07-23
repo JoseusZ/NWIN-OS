@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 NWIN OS
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 use linked_list_allocator::Heap;
 use spin::Mutex;
 use x86_64::instructions::interrupts;

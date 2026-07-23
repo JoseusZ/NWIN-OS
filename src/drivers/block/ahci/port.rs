@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 NWIN OS
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // src/drivers/block/ahci/port.rs
 
 use super::regs::{Volatile, HbaPortCmd};

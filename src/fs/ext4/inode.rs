@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 NWIN OS
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #[derive(Debug, Clone, Copy)]
 #[repr(packed)]
 pub struct Ext4Inode {

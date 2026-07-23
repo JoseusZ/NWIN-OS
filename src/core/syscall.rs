@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 NWIN OS
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 use x86_64::registers::model_specific::{Efer, EferFlags, Star, LStar, SFMask};
 use x86_64::registers::rflags::RFlags;
 use x86_64::VirtAddr;

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 NWIN OS
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 use core::sync::atomic::{AtomicU64, Ordering};
 use crate::fs::fd::FdTable;
 

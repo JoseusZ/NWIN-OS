@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 NWIN OS
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 use font8x8::{BASIC_FONTS, UnicodeFonts};
 
 /// Capa 1: Abstracción de Hardware (Framebuffer)

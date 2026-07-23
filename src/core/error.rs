@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 NWIN OS
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // src/error.rs
 
 /// # KernelError — sistema unificado de errores del kernel (Fase 1)
@@ -412,6 +416,328 @@ impl core::error::Error for KernelError {
             KernelError::Fs(e)        => Some(e),
             KernelError::Task(e)      => Some(e),
             KernelError::System(e)    => Some(e),
+        }
+    }
+}
+
+// ============================================================================
+// `From<...>` — Envoltorios automaticos para propagacion con `?` (Fase 2.1)
+// ============================================================================
+//
+// Despues de esta fase, cualquier llamada `?` desde un sub-error al
+// KernelError raiz es 100% valida en `no_std`. Por ejemplo:
+//
+//     fn load(path: &str) -> Result<VNode, KernelError> {
+//         let slice = open_vnode(path)?;              // FsError -> KernelError::Fs(...)
+//         let elf   = task::elf::load_elf(...)?;      // ElfError -> KernelError::Fs(FsError::Elf(...))
+//         Ok(VNode::new(elf))
+//     }
+//
+// Reglas de mapping:
+// - Cada sub-enum se envuelve en su variante homonima del `KernelError`
+//   raiz (Memory, Privilege, Hardware, Fs, Task, System).
+// - `ElfError` se trata como caso especial: va a `Fs(FsError::Elf(...))`
+//   porque el ELF Loader lee un archivo del VFS (su error es semantica
+//   de archivos). Esto deprecara en fases futuras al
+//   `KernelError::System(SystemError::ElfParseFailed)` cuando se migren
+//   los call sites.
+
+impl From<MemoryError> for KernelError {
+    fn from(e: MemoryError) -> Self {
+        KernelError::Memory(e)
+    }
+}
+
+impl From<PrivilegeError> for KernelError {
+    fn from(e: PrivilegeError) -> Self {
+        KernelError::Privilege(e)
+    }
+}
+
+impl From<HardwareError> for KernelError {
+    fn from(e: HardwareError) -> Self {
+        KernelError::Hardware(e)
+    }
+}
+
+impl From<FsError> for KernelError {
+    fn from(e: FsError) -> Self {
+        KernelError::Fs(e)
+    }
+}
+
+impl From<TaskError> for KernelError {
+    fn from(e: TaskError) -> Self {
+        KernelError::Task(e)
+    }
+}
+
+impl From<SystemError> for KernelError {
+    fn from(e: SystemError) -> Self {
+        KernelError::System(e)
+    }
+}
+
+impl From<ElfError> for KernelError {
+    fn from(e: ElfError) -> Self {
+        // Caso especial: un fallo de ELF se trata como un fallo del
+        // subsistema de archivos (el ELF Loader lee bytes del VFS,
+        // asi que su error es semanticamente de FS, no de System).
+        KernelError::Fs(FsError::Elf(e))
+    }
+}
+
+// ============================================================================
+// `From<&'static str>` — Puente temporal durante la migracion (Fase 2.1)
+// ============================================================================
+//
+// Esta implementacion existe estrictamente como **adaptador de
+// retrocompatibilidad** mientras el kernel termina de migrar todos
+// sus call sites de `Result<T, &'static str>` (Fase 3) a
+// `Result<T, KernelError>` o `Result<T, FsError>` tipados.
+//
+// Cada `&'static str` representa un mensaje que el codigo legacy
+// (FS layer) queria devolver; en la nueva taxonomia, ese mensaje
+// se canaliza como una `TaskCreationFailure` del envoltorio `System`
+// porque es la unica variante legacy que admite carga de payload sin
+// requerir una enum todavia no declarada como publica.
+//
+// IMPORTANTE: Este `From` **NO** es para uso de produccion nuevo.
+// Cuando la migracion termine (Fase 3 + Fase 6) y todos los call sites
+// produzcan errores tipados, esta implementacion se eliminara y el
+// `&'static str` se tratara como un `TaskCreationFailure` o cualquier
+// otra variante que exista en ese momento, con un mensaje embebido.
+//
+// Reglas:
+// - Solo mapea `'static str` porque es la unica variedad que vive
+//   en `.rodata` y no asigna. Mapear `String` requeriria heap.
+// - Cuando llegue la fase final y ya no haya call sites `&'static
+//   str`, esta implementacion se eliminara para forzar a usar las
+//   variantes tipadas.
+
+impl From<&'static str> for KernelError {
+    fn from(msg: &'static str) -> Self {
+        // `SystemError::TaskCreationFailure` actua aqui como cubeta
+        // generica para mensajes crudos heredados que aun no tienen
+        // representacion tipada. NO es semanticamente correcto decir
+        // "fallo de creacion de tarea" para un fallo de E/S de disco,
+        // pero es estrictamente temporal: convivira hasta que la
+        // migracion Fase 3 lo cambie por la variante especifica.
+        let _ = msg; // Reservado para una variante `SystemError::Legacy(Str)` futura.
+        KernelError::System(SystemError::TaskCreationFailure)
+    }
+}
+
+// ============================================================================
+// `errno` — Codigos POSIX para la frontera Ring 3 (Fase 2.2)
+// ============================================================================
+//
+// NWIN OS no es Linux. Solo en la frontera de syscalls (Ring 3 ->
+// Ring 0) respetamos la ABI Linux x86-64, y eso requiere traducir
+// cualquier `KernelError` interno a un entero negativo compatible
+// con `<errno.h>` de POSIX.
+//
+// Aritmetica del convenio:
+// - Los valores POSIX son positivos cuando se SEMANTIZAN, pero en la
+//   convencion de retorno de syscalls Linux se devuelven NEGATIVOS:
+//     -errno positivo  =>  -1, -2, ..., -22  en `rax` tras `sysretq`.
+//   Por lo tanto, `Errno` aqui representa los valores POSITIVOS
+//   (1, 2, 5, ...) y `to_errno()` los devuelve NEGATIVOS.
+//
+// Esto evita confusion y nos permite usar `Errno::EINVAL as i32` para
+// tests/asserts internos, mientras el handler `syscall` pone el valor
+// negativo en `regs.rax`.
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum Errno {
+    /// 1 — Operacion no permitida.
+    EPERM  = 1,
+    /// 2 — No existe el archivo o directorio.
+    ENOENT = 2,
+    /// 5 — Error de E/S de hardware.
+    EIO    = 5,
+    /// 6 — No existe el dispositivo o la direccion (e.g. un volumen
+    /// montado pide una operacion de E/S sobre un sector fuera de
+    /// rango). Usado por `HardwareError::ControllerMissing` y
+    /// `HardwareError::DeviceNotFound`.
+    ENXIO  = 6,
+    /// 8 — Formato de ejecutable invalido. Usado por `ElfError` para
+    /// `InvalidMagicNumber` y `Not64Bit`, replicando el codigo que
+    /// `src/core/syscall.rs` ya devolvia ante un ELF malformado.
+    ENOEXEC = 8,
+    /// 9 — Descriptor de archivo invalido.
+    EBADF  = 9,
+    /// 12 — Memoria insuficiente.
+    ENOMEM = 12,
+    /// 13 — Permiso denegado.
+    EACCES = 13,
+    /// 14 — Direccion de memoria invalida.
+    EFAULT = 14,
+    /// 17 — El archivo ya existe.
+    EEXIST = 17,
+    /// 22 — Argumento invalido.
+    EINVAL = 22,
+    /// 28 — Sin espacio en el dispositivo.
+    ENOSPC = 28,
+    /// 38 — Llamada al sistema no implementada.
+    ENOSYS = 38,
+}
+
+impl Errno {
+    /// Devuelve el valor **negativo** del errno, listo para colocar
+    /// en `rax`/`regs.rax` antes de `sysretq`. Coincide 1:1 con los
+    /// valores hardcodeados que ya estaban en `src/core/syscall.rs`.
+    #[inline]
+    pub fn to_neg_i32(self) -> i32 {
+        // `as i32` es seguro porque `Errno` es `#[repr(i32)]` y solo
+        // contiene variantes con discriminante >= 1. El negativo de
+        // un valor positivo cabe en i32 sin overflow.
+        -(self as i32)
+    }
+}
+
+// ============================================================================
+// `to_errno()` — Traduccion unificada `KernelError -> i32` (Fase 2.2)
+// ============================================================================
+//
+// Cada sub-enum implementa su propia `to_errno()`. La regla es coherente
+// con la tabla POSIX: errores del subsistema VFS caen en ENOENT/EFAULT/
+// ENOMEM/EIO/EBADF/etc. segun el `match`. Errores de CPU caen en
+// EFAULT (cuando es una violacion que no debe matar al proceso) o
+// se signalizan via -11 (SIGSEGV) en el handler.
+//
+// `to_errno()` aqui devuelve un `i32` NEGATIVO para que el syscall
+// handler haga simplemente `regs.rax = e.to_errno() as u64`.
+
+fn mt(inner: Errno) -> i32 {
+    inner.to_neg_i32()
+}
+
+impl MemoryError {
+    pub fn to_errno(&self) -> i32 {
+        match self {
+            // #PF en ring 3 → EFAULT (segun Linux: SIGSEGV = 11, pero
+            // Linux devuelve -EFAULT como codigo de syscall si el
+            // problema es una direccion invalida).
+            MemoryError::PageFault { .. }                  => mt(Errno::EFAULT),
+            MemoryError::OutOfFrames                      => mt(Errno::ENOMEM),
+            MemoryError::HeapOOM                          => mt(Errno::ENOMEM),
+            MemoryError::InvalidMapping                   => mt(Errno::EFAULT),
+            MemoryError::CoWResolutionFailed              => mt(Errno::EFAULT),
+            MemoryError::HhdmMissing                      => mt(Errno::EFAULT),
+        }
+    }
+}
+
+impl PrivilegeError {
+    pub fn to_errno(&self) -> i32 {
+        match self {
+            // #GP/#UD/#DE/#DF — el handler en `idt.rs` ya termina la
+            // tarea antes de convertir un fallo de CPU a errno. Este
+            // mapeo es defensivo para rutas futuras donde el kernel
+            // quiera devolverlo limpiamente.
+            PrivilegeError::GeneralProtectionFault { .. } => mt(Errno::EFAULT),
+            PrivilegeError::InvalidOpcode { is_user }     => {
+                if *is_user { mt(Errno::ENOSYS) } else { mt(Errno::EFAULT) }
+            }
+            PrivilegeError::DivideError { is_user }        => {
+                if *is_user { mt(Errno::EFAULT) } else { mt(Errno::EFAULT) }
+            }
+            PrivilegeError::DoubleFault                   => mt(Errno::EFAULT),
+            PrivilegeError::PermissionDenied               => mt(Errno::EACCES),
+        }
+    }
+}
+
+impl HardwareError {
+    pub fn to_errno(&self) -> i32 {
+        match self {
+            HardwareError::IoFailure              => mt(Errno::EIO),
+            HardwareError::ControllerMissing      => mt(Errno::ENXIO),   // 6 — No existe el dispositivo
+            HardwareError::UnsupportedProtocol    => mt(Errno::ENOSYS),
+            HardwareError::DeviceNotFound         => mt(Errno::ENXIO),
+        }
+    }
+}
+
+impl FsError {
+    pub fn to_errno(&self) -> i32 {
+        match self {
+            FsError::BlockRead                       => mt(Errno::EIO),
+            FsError::BlockWrite                      => mt(Errno::EIO),
+            FsError::BadMagic { .. }                 => mt(Errno::EINVAL),
+            FsError::MbrInvalid                      => mt(Errno::EINVAL),
+            FsError::GptOnly                         => mt(Errno::EINVAL),
+            FsError::UnknownPartition(_)             => mt(Errno::EINVAL),
+            FsError::VfsEntryMissing                 => mt(Errno::ENOENT),
+            FsError::OutOfInodes                     => mt(Errno::ENOSPC),
+            FsError::OutOfBlocks                     => mt(Errno::ENOSPC),
+            FsError::CorruptedDirectory              => mt(Errno::EIO),
+            FsError::NoSpace                         => mt(Errno::ENOSPC),
+            FsError::Elf(inner)                     => inner.to_errno(),
+        }
+    }
+}
+
+impl TaskError {
+    pub fn to_errno(&self) -> i32 {
+        match self {
+            TaskError::StackAllocation      => mt(Errno::ENOMEM),
+            TaskError::EntryMissing         => mt(Errno::EINVAL),
+            TaskError::PrivilegeMismatch    => mt(Errno::EACCES),
+            TaskError::TaskCreationFailure  => mt(Errno::EINVAL),
+        }
+    }
+}
+
+impl SystemError {
+    pub fn to_errno(&self) -> i32 {
+        match self {
+            SystemError::ElfParseFailed(inner) => inner.to_errno(),
+            SystemError::TaskCreationFailure   => mt(Errno::EINVAL),
+        }
+    }
+}
+
+impl ElfError {
+    /// Extension minima requerida para que `FsError::to_errno()` y
+    /// `SystemError::to_errno()` deleguen con `inner.to_errno()`
+    /// en vez de usar `Display`. La tabla:
+    /// - `InvalidMagicNumber` y `Not64Bit` → -ENOEXEC (8).
+    ///   Es exactamente el valor que el codigo actual de
+    ///   `src/core/syscall.rs` ya devolvia para `execve` con
+    ///   ELF invalido.
+    /// - `MemoryMappingFailed` → -ENOMEM.
+    /// - `TooSmall` → -EINVAL.
+    pub fn to_errno(&self) -> i32 {
+        mt(match self {
+            ElfError::TooSmall            => Errno::EINVAL,
+            ElfError::InvalidMagicNumber  => Errno::ENOEXEC,
+            ElfError::Not64Bit            => Errno::ENOEXEC,
+            ElfError::MemoryMappingFailed => Errno::ENOMEM,
+        })
+    }
+}
+
+impl KernelError {
+    /// Punto de entrada publico para la frontera de syscalls. Traduce
+    /// cualquier `KernelError` al entero negativo POSIX que el proceso
+    /// de usuario recibira en `rax` (en Linux: `regs.rax = e as u64`).
+    ///
+    /// Llamada canonica en `handle_syscall_rust`:
+    /// ```ignore
+    /// regs.rax = kernel_error.to_errno() as u64;
+    /// ```
+    pub fn to_errno(&self) -> i32 {
+        match self {
+            KernelError::Memory(e)    => e.to_errno(),
+            KernelError::Privilege(e) => e.to_errno(),
+            KernelError::Hardware(e)  => e.to_errno(),
+            KernelError::Fs(e)        => e.to_errno(),
+            KernelError::Task(e)      => e.to_errno(),
+            KernelError::System(e)    => e.to_errno(),
         }
     }
 }

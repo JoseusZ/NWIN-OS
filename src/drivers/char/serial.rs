@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 NWIN OS
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 use core::fmt;
 use spin::Mutex;
 use lazy_static::lazy_static;

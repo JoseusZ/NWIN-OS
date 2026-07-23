@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 NWIN OS
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::cell::UnsafeCell;
 use spin::Mutex as SpinMutex;

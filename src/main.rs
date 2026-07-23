@@ -2,6 +2,10 @@
 #![no_main]
 #![feature(abi_x86_interrupt)]
 
+// SPDX-FileCopyrightText: 2026 NWIN OS
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 extern crate alloc;
 
 pub mod core;

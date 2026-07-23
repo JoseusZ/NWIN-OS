@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 NWIN OS
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 use spin::Mutex;
 use limine::memmap::MEMMAP_USABLE;
 use x86_64::structures::paging::{

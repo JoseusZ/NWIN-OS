@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 NWIN OS
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PhysFrame;
 
@@ -8,6 +12,30 @@ pub enum ElfError {
     Not64Bit,
     MemoryMappingFailed,
 }
+
+// ----------------------------------------------------------------------------
+// `core::fmt::Display` + `core::error::Error` para `ElfError`
+// ----------------------------------------------------------------------------
+// Necesario para que `FsError::source()` y `SystemError::source()` (en
+// `src/core/error.rs`) puedan devolver `Some(&ElfError)` como
+// `&dyn core::error::Error`, y para que `Display` de `FsError` pueda
+// formatear la variante `Elf(inner)` con `{}` en vez de `{:?}`.
+//
+// Como `ElfError` no contiene errores anidados (sus variantes son
+// unitarias), `source()` siempre devuelve `None`.
+
+impl core::fmt::Display for ElfError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ElfError::TooSmall => write!(f, "ELF binary too small"),
+            ElfError::InvalidMagicNumber => write!(f, "Invalid ELF magic number"),
+            ElfError::Not64Bit => write!(f, "ELF is not 64-bit"),
+            ElfError::MemoryMappingFailed => write!(f, "Failed to map memory for ELF segment"),
+        }
+    }
+}
+
+impl core::error::Error for ElfError {}
 
 /// Analiza un archivo ELF en memoria y mapea sus segmentos en una PML4 ESPECÍFICA.
 pub fn load_elf(elf_slice: &[u8], target_pml4: PhysFrame) -> Result<u64, ElfError> {

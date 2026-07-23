@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 NWIN OS
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // src/drivers/pci.rs
 use x86_64::instructions::port::Port;
 use alloc::vec::Vec;
