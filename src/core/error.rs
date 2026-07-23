@@ -1,6 +1,26 @@
 // src/error.rs
 
-/// El error maestro del kernel. 
+/// # KernelError — sistema unificado de errores del kernel (Fase 1)
+/// Contrato: `KernelError` es el **unico enum de error raiz** del
+/// kernel NWIN OS. A partir de las Fase 1.x todas las funciones
+/// falibles devolveran `Result<T, KernelError>` o `Result<T,
+/// SubError>` cuando un `From<SubError> for KernelError` exista.
+///
+/// ## Capas cubiertas (ordenadas por dominio):
+/// - `Memory(MemoryError)`            — fallos en paginacion / heap / CoW
+/// - `Privilege(PrivilegeError)`       — #PF, #GP, #UD, #DE, #DF
+/// - `Hardware(HardwareError)`         — fallos de E/S y controladoras
+/// - `Syscall(...)`                    — fase 2.5; pendiente
+/// - `Fs(FsError)`                     — VFS / FAT / ext4 / MBR
+/// - `Task(TaskError)`                 — TaskManager / spawn / context_switch
+/// - `Mm(...)`                         — fase 2.5; pendiente
+///
+/// Regla arquitectonica: NWIN OS no es Linux. Este `KernelError`
+/// representa la **semantica interna en Rust**. Solo en la frontera
+/// Ring 3 (syscalls) se traduce a `errno` POSIX mediante
+/// `KernelError::to_errno()` (Fase 2.5).
+///
+/// El error maestro del kernel.
 /// A partir de ahora, las funciones falibles devolverán Result<T, KernelError>
 #[derive(Debug, Clone)]
 pub enum KernelError {
