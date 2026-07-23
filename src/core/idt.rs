@@ -90,10 +90,15 @@ extern "x86-interrupt" fn page_fault_handler(
     let fault_addr = Cr2::read();
 
     // 1. Extracción de Banderas de Diagnóstico
+    // - `is_present` y `is_write` se usan en la rama de Copy-on-Write.
+    // - `is_user` se usa en el veredicto Ring 3 vs Ring 0.
+    // - `is_instruction_fetch` ya NO se guarda: la nueva API
+    //   `MemoryError::PageFault { addr, flags }` almacena `error_code.bits()`
+    //   en crudo y los consumidores futuros pueden extraer estas senales
+    //   con `bitflags` desde `flags`.
     let is_present = error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION);
     let is_write = error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE);
     let is_user = error_code.contains(PageFaultErrorCode::USER_MODE);
-    let is_instruction_fetch = error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH);
 
     // 2. Intercepción del Copy-on-Write (CoW)
     if is_present && is_write {
@@ -104,10 +109,8 @@ extern "x86-interrupt" fn page_fault_handler(
 
     // 3. Construcción del Error Estructurado
     let pf_error = crate::core::error::KernelError::Memory(crate::core::error::MemoryError::PageFault {
-        vaddr: fault_addr.as_u64(),
-        is_user,
-        is_write,
-        is_instruction_fetch,
+        addr: fault_addr.as_u64() as usize,
+        flags: error_code.bits(),
     });
 
     // 4. El Veredicto (Ring 3 vs Ring 0)
