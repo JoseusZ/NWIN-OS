@@ -2,6 +2,18 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Physical frame allocator with Copy-on-Write reference counting.
+//!
+//! `BitmapFrameAllocator` owns two parallel arrays:
+//! - `bitmap`, one bit per 4 KiB frame: `1` = busy / `0` = free.
+//! - `ref_counts`, one `u16` per frame: tracks how many mappings own
+//!   the frame so the deallocation path can avoid double frees and
+//!   the IDT page-fault handler can clone a CoW page before writing.
+//!
+//! Both arrays are placed inside the first `MEMMAP_USABLE` region
+//! large enough to host them, then the global `ALLOCATOR` is wired
+//! to the page-table mapper via [`SystemFrameAllocator`].
+
 use spin::Mutex;
 use limine::memmap::MEMMAP_USABLE;
 use x86_64::structures::paging::{
@@ -10,20 +22,22 @@ use x86_64::structures::paging::{
 use x86_64::{PhysAddr, VirtAddr};
 use x86_64::registers::control::{Cr3, Cr3Flags};
 
+/// Size of a single physical frame in bytes.
 pub const FRAME_SIZE: u64 = 4096;
 
+/// Bitmap-backed frame allocator with per-frame reference counts.
 pub struct BitmapFrameAllocator {
     bitmap: &'static mut [u8],
-    // --- NUEVO: Arreglo de Referencias para Copy-on-Write ---
-    ref_counts: &'static mut [u16], 
+    ref_counts: &'static mut [u16],
     total_frames: usize,
     last_free_frame_hint: usize,
 }
 
-// 1. Ocultar ALLOCATOR detrás de una función para evitar accesos directos peligrosos.
 static ALLOCATOR: Mutex<BitmapFrameAllocator> = Mutex::new(BitmapFrameAllocator::empty());
 
 impl BitmapFrameAllocator {
+    /// Returns an empty allocator. Call [`Self::init`] once to bind
+    /// the bitmap and reference-count slices to physical memory.
     pub const fn empty() -> Self {
         Self {
             bitmap: &mut [],
@@ -33,19 +47,25 @@ impl BitmapFrameAllocator {
         }
     }
 
+    /// Initialises the allocator from the Limine memory map:
+    /// 1. Computes the high physical address reachable from any of
+    ///    the four memmap kinds the kernel can touch (usable RAM,
+    ///    bootloader-reclaimable, executable/modules, framebuffer).
+    /// 2. Picks the first usable region large enough to host the
+    ///    bitmap + the reference-count array and parks the metadata
+    ///    there.
+    /// 3. Marks every usable frame free in the bitmap and reserves
+    ///    the metadata region.
     pub fn init(&mut self) {
-        let mmap_response = crate::MEMMAP_REQUEST.response().expect("PANICO: Sin mapa de memoria");
+        let mmap_response = crate::MEMMAP_REQUEST.response().expect("panic: no memory map");
         let entries = mmap_response.entries();
 
-        // 1. CORRECCIÓN CRÍTICA: Calcular max_addr ignorando el MMIO
         let mut max_addr = 0;
         for entry in entries {
-            // Solo rastreamos la memoria que nos pertenece o que podemos leer,
-            // ignorando reservas de hardware con direcciones estratosféricas.
-            if entry.type_ == limine::memmap::MEMMAP_USABLE 
+            if entry.type_ == limine::memmap::MEMMAP_USABLE
                 || entry.type_ == limine::memmap::MEMMAP_BOOTLOADER_RECLAIMABLE
                 || entry.type_ == limine::memmap::MEMMAP_EXECUTABLE_AND_MODULES
-                || entry.type_ == limine::memmap::MEMMAP_FRAMEBUFFER 
+                || entry.type_ == limine::memmap::MEMMAP_FRAMEBUFFER
             {
                 let top = entry.base + entry.length;
                 if top > max_addr { max_addr = top; }
@@ -53,14 +73,14 @@ impl BitmapFrameAllocator {
         }
 
         let total_frames = ((max_addr + FRAME_SIZE - 1) / FRAME_SIZE) as usize;
-        
+
         let raw_bitmap_size = (total_frames + 7) / 8;
-        let bitmap_size_aligned = (raw_bitmap_size + 7) & !7; 
-        
+        let bitmap_size_aligned = (raw_bitmap_size + 7) & !7;
+
         let refcounts_size_in_bytes = total_frames * core::mem::size_of::<u16>();
         let metadata_total_size = bitmap_size_aligned as u64 + refcounts_size_in_bytes as u64;
 
-        // 2. CORRECCIÓN DE SEGURIDAD: Evitar falsos positivos si la RAM arranca en 0x0
+        // Defensive: avoids false positives if a region's base is 0x0.
         let mut metadata_phys_addr: Option<u64> = None;
         for entry in entries {
             if entry.type_ == MEMMAP_USABLE && entry.length >= metadata_total_size {
@@ -69,22 +89,21 @@ impl BitmapFrameAllocator {
             }
         }
 
-        let metadata_phys_addr = metadata_phys_addr.expect("PANICO: No hay RAM contigua para la metadata del Allocator");
+        let metadata_phys_addr = metadata_phys_addr.expect("panic: no contiguous RAM for allocator metadata");
 
-        // --- RESTAURADO: El resto de la inicialización que se había borrado ---
         let hhdm_offset = crate::HHDM_REQUEST.response()
-            .expect("Fallo crítico: El Bootloader no proporcionó HHDM").offset;
-            
+            .expect("fatal: bootloader did not provide HHDM").offset;
+
         let metadata_virt_ptr = (hhdm_offset + metadata_phys_addr) as *mut u8;
 
         unsafe {
             let bitmap_slice = core::slice::from_raw_parts_mut(metadata_virt_ptr, raw_bitmap_size);
-            bitmap_slice.fill(0xFF); // RAM ocupada por defecto
+            bitmap_slice.fill(0xFF); // Every frame is busy by default.
             self.bitmap = bitmap_slice;
 
             let refcounts_virt_ptr = metadata_virt_ptr.add(bitmap_size_aligned) as *mut u16;
             let refcounts_slice = core::slice::from_raw_parts_mut(refcounts_virt_ptr, total_frames);
-            refcounts_slice.fill(1); // Cada bloque arranca con 1 referencia base
+            refcounts_slice.fill(1); // Reserved frames start at refcount 1.
             self.ref_counts = refcounts_slice;
         }
 
@@ -94,7 +113,7 @@ impl BitmapFrameAllocator {
             if entry.type_ == MEMMAP_USABLE {
                 let start_frame = ((entry.base + FRAME_SIZE - 1) / FRAME_SIZE) as usize;
                 let end_frame = ((entry.base + entry.length) / FRAME_SIZE) as usize;
-                
+
                 for i in start_frame..end_frame {
                     self.force_free_bit(i);
                 }
@@ -103,15 +122,17 @@ impl BitmapFrameAllocator {
 
         let metadata_start_frame = (metadata_phys_addr / FRAME_SIZE) as usize;
         let metadata_end_frame = metadata_start_frame + ((metadata_total_size + FRAME_SIZE - 1) / FRAME_SIZE) as usize;
-        
+
         for i in metadata_start_frame..metadata_end_frame {
             self.force_set_bit(i);
         }
 
-        self.force_set_bit(0); // Proteger marco 0
-    } // <--- LLAVE CERRADA CORRECTAMENTE
+        self.force_set_bit(0); // Always reserve frame 0 (NULL guard).
+    }
 
-    // --- OPERACIONES INTERNAS DE INICIALIZACION ---
+    // ----------------------------------------------------------------
+    // Internal bit manipulation helpers
+    // ----------------------------------------------------------------
 
     fn force_set_bit(&mut self, frame: usize) {
         if frame >= self.total_frames { return; }
@@ -121,7 +142,6 @@ impl BitmapFrameAllocator {
         self.ref_counts[frame] = 1;
     }
 
-    // RESTAURADO: Se separó force_free_bit de test_bit
     fn force_free_bit(&mut self, frame: usize) {
         if frame >= self.total_frames { return; }
         let byte = frame / 8;
@@ -131,14 +151,19 @@ impl BitmapFrameAllocator {
     }
 
     fn test_bit(&self, frame: usize) -> bool {
-        if frame >= self.total_frames { return true; } // Asumir ocupado si está fuera de rango
+        // Out-of-range frames are treated as busy to keep `allocate_frame` sound.
+        if frame >= self.total_frames { return true; }
         let byte = frame / 8;
         let bit = frame % 8;
         (self.bitmap[byte] & (1 << bit)) != 0
     }
 
-    // --- INTERFAZ DEL ALLOCATOR CON SOPORTE CoW ---
+    // ----------------------------------------------------------------
+    // Public allocator API (with Copy-on-Wire reference counting)
+    // ----------------------------------------------------------------
 
+    /// Picks the lowest free frame starting from the cached hint and
+    /// wraps once around the table when the hint is reached.
     pub fn allocate_frame(&mut self) -> Option<u64> {
         for i in self.last_free_frame_hint..self.total_frames {
             if !self.test_bit(i) {
@@ -147,7 +172,7 @@ impl BitmapFrameAllocator {
                 return Some((i as u64) * FRAME_SIZE);
             }
         }
-        
+
         for i in 0..self.last_free_frame_hint {
             if !self.test_bit(i) {
                 self.force_set_bit(i);
@@ -155,56 +180,62 @@ impl BitmapFrameAllocator {
                 return Some((i as u64) * FRAME_SIZE);
             }
         }
-        None 
+        None
     }
 
-    /// NUEVO: Implementación CoW - Solo libera el marco si las referencias llegan a 0.
+    /// Drops one reference to the frame holding `phys_addr`. The
+    /// frame returns to the free pool only when the reference
+    /// counter reaches zero; otherwise the underlying physical
+    /// memory stays mapped for the other owners (CoW path).
     pub fn deallocate_frame(&mut self, phys_addr: u64) {
         let frame = (phys_addr / FRAME_SIZE) as usize;
-        assert!(frame < self.total_frames, "Fallo fatal: Intento de liberar marco inexistente");
-        
+        assert!(frame < self.total_frames, "fatal: deallocate of unknown frame");
+
         if self.ref_counts[frame] > 0 {
             self.ref_counts[frame] -= 1;
-            
-            // Si nadie más usa este marco, lo liberamos de verdad
+
             if self.ref_counts[frame] == 0 {
                 let byte = frame / 8;
                 let bit = frame % 8;
                 self.bitmap[byte] &= !(1 << bit);
-                
+
                 if frame < self.last_free_frame_hint {
                     self.last_free_frame_hint = frame;
                 }
             }
         } else {
-            panic!("Doble liberacion de memoria detectada en Ring 0 (Marco {})", frame);
+            panic!("double free detected in Ring 0 (frame {})", frame);
         }
     }
 
-    /// NUEVO: Incrementa el contador de referencias. VITAL para tu futura syscall fork().
+    /// Adds an extra reference to a frame. Required by the future
+    /// `fork` syscall so child tasks share their pages copy-on-write.
     pub fn reference_frame(&mut self, phys_addr: u64) {
         let frame = (phys_addr / FRAME_SIZE) as usize;
-        assert!(frame < self.total_frames, "Fallo fatal: Intento de referenciar marco inexistente");
-        assert!(self.ref_counts[frame] > 0, "Intento de compartir un marco libre");
-        
+        assert!(frame < self.total_frames, "fatal: reference of unknown frame");
+        assert!(self.ref_counts[frame] > 0, "tried to share an unowned frame");
+
         self.ref_counts[frame] += 1;
     }
 
-    /// NUEVO: Expone el contador para que el IDT decida si debe clonar la página.
+    /// Exposes the current reference count so the page-fault handler
+    /// can decide whether to clone the page before writing to it.
     pub fn get_ref_count(&self, phys_addr: u64) -> u16 {
         let frame = (phys_addr / FRAME_SIZE) as usize;
-        if frame >= self.total_frames { return 1; } // Bloques reservados son inmutables
+        if frame >= self.total_frames { return 1; }
         self.ref_counts[frame]
     }
 
-    // Algoritmo de contigüidad optimizado (Se mantiene para memoria no compartida/DMA)
+    /// First-fit contiguous allocation. Reserved for non-shareable
+    /// paths (DMA bounce buffers, etc.) where CoW semantics would
+    /// only complicate ownership.
     pub fn allocate_contiguous_frames(&mut self, count: usize) -> Option<u64> {
         if count == 0 { return None; }
-        
+
         let mut i = 0;
         while i <= self.total_frames.saturating_sub(count) {
             let mut free_run = 0;
-            
+
             for j in 0..count {
                 if self.test_bit(i + j) {
                     break;
@@ -225,10 +256,15 @@ impl BitmapFrameAllocator {
     }
 }
 
-// Proxy Seguro Anti-Deadlocks
+/// Lock-free facade around the global `ALLOCATOR`. Implementing the
+/// `x86_64` `FrameAllocator` trait on a zero-sized type avoids
+/// exposing the inner `MutexGuard` to callers, which would create
+/// easy avenues for accidental deadlocks.
 pub struct SystemFrameAllocator;
 
-// API Pública controlada para obtener memoria
+/// Acquires the global allocator guard. Equivalent to
+/// `ALLOCATOR.lock()` but kept as a function so refactorings can
+/// later add lock-ordering metadata in one place.
 pub fn get_allocator() -> spin::MutexGuard<'static, BitmapFrameAllocator> {
     ALLOCATOR.lock()
 }
@@ -237,49 +273,51 @@ unsafe impl PagingFrameAllocator<Size4KiB> for SystemFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
         x86_64::instructions::interrupts::without_interrupts(|| {
             let frame_address = get_allocator().allocate_frame()?;
-            
-            let hhdm_offset = crate::HHDM_REQUEST.response().expect("Sin HHDM").offset;
+            let hhdm_offset = crate::HHDM_REQUEST.response().expect("no HHDM").offset;
             let virt_addr = frame_address + hhdm_offset;
+            // Zero out the freshly-allocated frame so callers don't
+            // observe whatever data the boot-time memory map listed as
+            // "free".
             unsafe {
                 core::ptr::write_bytes(virt_addr as *mut u8, 0, 4096);
             }
-            
             let phys_addr = PhysAddr::new(frame_address);
             Some(PhysFrame::containing_address(phys_addr))
         })
     }
 }
 
+/// Builds an isolated PML4 by cloning Limine's live table.
+///
+/// Copies every in-use entry from both halves. Limine leaves HHDM and
+/// any user-mode mappings in the lower 256 entries; without copying
+/// them the new PML4 cannot translate the offsets the kernel itself
+/// uses to touch physical memory, which surfaces as cascading
+/// `#GP`/`#DF`.
 pub unsafe fn isolate_and_init_paging(
     physical_memory_offset: VirtAddr,
     allocator: &mut impl PagingFrameAllocator<Size4KiB>,
 ) -> OffsetPageTable<'static> {
-    
+
     let (limine_pml4_frame, _) = Cr3::read();
     let limine_pml4_virt = physical_memory_offset + limine_pml4_frame.start_address().as_u64();
     let limine_pml4: &PageTable = &*(limine_pml4_virt.as_ptr());
 
-    let new_pml4_frame = allocator.allocate_frame().expect("PANICO: Sin memoria fisica para la nueva PML4");
+    let new_pml4_frame = allocator.allocate_frame().expect("panic: no physical RAM for the new PML4");
     let new_pml4_phys = new_pml4_frame.start_address();
     let new_pml4_virt = physical_memory_offset + new_pml4_phys.as_u64();
-    
-    let new_pml4: &mut PageTable = &mut *(new_pml4_virt.as_mut_ptr());
-    new_pml4.zero(); 
 
-    // Copiamos la mitad superior (Kernel Space)
+    let new_pml4: &mut PageTable = &mut *(new_pml4_virt.as_mut_ptr());
+    new_pml4.zero();
+
+    // Copy the upper half (kernel space).
     for i in 256..512 {
         new_pml4[i] = limine_pml4[i].clone();
     }
-    
-    // *** FIX CRÍTICO: Copiar también entradas de la mitad user ***
-    // Limine pone el HHDM en la mitad user (índices < 256). Sin esto,
-    // la nueva PML4 no puede traducir las direcciones del HHDM que usa
-    // para acceder a memoria física, y todo #GP/#DF en cascada.
-    //
-    // Estrategia segura: copiar TODAS las entradas no-vacías de Limine.
-    // Esto preserva HHDM + cualquier mapping que Limine haya hecho en
-    // el rango user. Como después vamos a usar la mitad kernel para
-    // todo, las entradas copiadas de la mitad user no se solapan.
+
+    // Copy every non-empty lower-half entry Limine provisioned (notably
+    // HHDM). The kernel will run from the upper half afterwards, so
+    // the lower-half copies never collide with kernel mappings.
     for i in 0..256 {
         let entry = limine_pml4[i].clone();
         if !entry.is_unused() {
@@ -290,64 +328,63 @@ pub unsafe fn isolate_and_init_paging(
     Cr3::write(new_pml4_frame, Cr3Flags::empty());
     OffsetPageTable::new(new_pml4, physical_memory_offset)
 }
-// --- API PUBLICA SEGURA PARA COPY-ON-WRITE (CoW) ---
 
-/// Incrementa de forma segura el contador de referencias de un marco físico.
+// ----------------------------------------------------------------
+// IRQ-safe CoW reference helpers
+// ----------------------------------------------------------------
+
+/// Bumps the reference count of `phys_addr`.
 pub fn cow_reference_frame(phys_addr: u64) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         get_allocator().reference_frame(phys_addr);
     });
 }
 
-/// Disminuye el contador de referencias y libera el marco si llega a 0.
+/// Decrements the reference count and releases the frame when it
+/// reaches zero.
 pub fn cow_deallocate_frame(phys_addr: u64) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         get_allocator().deallocate_frame(phys_addr);
     });
 }
 
-/// Consulta cuántas tareas están usando este marco físico actualmente.
+/// Reads the current reference count for the frame holding
+/// `phys_addr`.
 pub fn cow_get_ref_count(phys_addr: u64) -> u16 {
     x86_64::instructions::interrupts::without_interrupts(|| {
         get_allocator().get_ref_count(phys_addr)
     })
 }
 
-// --- TRADUCCIÓN DE DIRECCIONES ---
-
-/// Traduce una dirección virtual a física leyendo las tablas de páginas actuales de la CPU.
-/// Es seguro llamarla desde el IDT durante un Page Fault.
+/// Translates a virtual address to the physical address the
+/// currently active page table maps it to. Safe to call from the
+/// page-fault handler.
 pub fn translate_addr(addr: VirtAddr) -> Option<PhysAddr> {
-    // 1. Obtenemos el offset HHDM que el bootloader nos dio
     let hhdm_offset = crate::HHDM_REQUEST.response()
-        .expect("Fallo crítico: El Bootloader no proporcionó HHDM").offset;
+        .expect("fatal: bootloader did not provide HHDM").offset;
     let phys_mem_offset = VirtAddr::new(hhdm_offset);
 
-    // 2. Leemos la dirección física de la PML4 activa desde el registro Cr3
     let (pml4_frame, _) = Cr3::read();
-    
-    // 3. Calculamos la dirección virtual donde podemos leer/modificar esta tabla
     let pml4_virt = phys_mem_offset + pml4_frame.start_address().as_u64();
-    
-    // 4. Creamos una referencia mutable temporal a la tabla (requerida por OffsetPageTable)
     let pml4 = unsafe { &mut *(pml4_virt.as_mut_ptr()) };
 
-    // 5. Instanciamos el mapper temporalmente y traducimos
     let mapper = unsafe { OffsetPageTable::new(pml4, phys_mem_offset) };
-    
-    // Usamos el trait 'Translate' para hacer el trabajo sucio por nosotros
     mapper.translate_addr(addr)
 }
 
-// --- RESOLUCIÓN COPY-ON-WRITE ---
-
-/// Resuelve un fallo de página causado por Copy-on-Write.
-/// Retorna `true` si logró clonar la página y restaurar los permisos.
-// --- RESOLUCIÓN COPY-ON-WRITE ---
+/// Resolves a Copy-on-Write page fault.
+///
+/// Promotes the page to writable if the caller is its sole owner.
+/// Otherwise clones the underlying frame, reattaches it to the
+/// faulting address, and decrements the previous frame's reference
+/// count so the CoW bookkeeping remains consistent.
+///
+/// Returns `true` when the page fault is repaired and the CPU can
+/// retry the faulting instruction.
 pub fn resolve_cow_fault(fault_addr: VirtAddr) -> bool {
     use x86_64::structures::paging::{Mapper, Page, PageTableFlags, PhysFrame};
-    
-    let hhdm_offset = crate::HHDM_REQUEST.response().expect("Fallo crítico: Sin HHDM").offset;
+
+    let hhdm_offset = crate::HHDM_REQUEST.response().expect("fatal: no HHDM").offset;
     let phys_mem_offset = VirtAddr::new(hhdm_offset);
 
     let (pml4_frame, _) = x86_64::registers::control::Cr3::read();
@@ -368,22 +405,21 @@ pub fn resolve_cow_fault(fault_addr: VirtAddr) -> bool {
     };
 
     let ref_count = cow_get_ref_count(phys_addr.as_u64());
-    if ref_count == 0 { return false; } 
+    if ref_count == 0 { return false; }
 
-    // --- ESTO FUE LO QUE SE BORRÓ ACCIDENTALMENTE ---
+    // Sole owner: just flip the page to writable.
     if ref_count == 1 {
         unsafe {
             mapper.update_flags(page, current_flags | PageTableFlags::WRITABLE)
-                .expect("Fallo al actualizar flags CoW")
-                .flush(); 
+                .expect("failed to update CoW flags")
+                .flush();
         }
         return true;
     }
-    // ------------------------------------------------
 
     let new_frame_addr = match get_allocator().allocate_frame() {
         Some(addr) => addr,
-        None => return false, 
+        None => return false,
     };
     let new_frame = PhysFrame::containing_address(x86_64::PhysAddr::new(new_frame_addr));
 
@@ -392,12 +428,12 @@ pub fn resolve_cow_fault(fault_addr: VirtAddr) -> bool {
         let dst_ptr = (phys_mem_offset + new_frame_addr).as_mut_ptr::<u8>();
         core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, 4096);
 
-        let (_, flush) = mapper.unmap(page).expect("Fallo al desmapear página CoW");
+        let (_, flush) = mapper.unmap(page).expect("failed to unmap CoW page");
         flush.flush();
 
         let mut allocator = SystemFrameAllocator;
         mapper.map_to(page, new_frame, current_flags | PageTableFlags::WRITABLE, &mut allocator)
-            .expect("Fallo al mapear clon CoW")
+            .expect("failed to remap CoW clone")
             .flush();
     }
 
@@ -405,137 +441,145 @@ pub fn resolve_cow_fault(fault_addr: VirtAddr) -> bool {
     true
 }
 
-/// Mapea una página virtual específica asignándole permisos de Ring 3 (Usuario).
-/// VITAL para poder ejecutar procesos fuera del Kernel.
-/// Mapea una página virtual específica asignándole permisos de Ring 3 (Usuario).
-/// VITAL para poder ejecutar procesos fuera del Kernel.
-/// Mapea una página virtual específica asignándole permisos de Ring 3 (Usuario).
-/// AHORA RECIBE LA PML4 DESTINO PARA NO DEPENDER DEL CR3.
-/// Mapea una página virtual específica en una PML4 REMOTA.
+/// Maps a single page in a remote PML4 without switching CR3 — used
+/// by the ELF loader to set up a user-mode address space.
+///
+/// On success the page is allocated, zero-filled, and inserted in the
+/// target page table with `PRESENT | WRITABLE | USER_ACCESSIBLE`
+/// flags.
+///
+/// # Errors
+///
+/// Returns [`crate::core::error::KernelError::Memory`] when either
+/// the frame allocator is exhausted
+/// (`MemoryError::OutOfFrames`) or the mapping collides with an
+/// existing entry (`MemoryError::InvalidMapping`).
 pub fn allocate_and_map_user_page(
-    target_pml4: x86_64::structures::paging::PhysFrame, 
+    target_pml4: x86_64::structures::paging::PhysFrame,
     virtual_address: x86_64::VirtAddr
-) -> Result<(), &'static str> {
+) -> Result<(), crate::core::error::KernelError> {
     use x86_64::structures::paging::{Mapper, Page, PageTableFlags, PhysFrame, OffsetPageTable, PageTable, Size4KiB};
-    
-    let hhdm_offset = crate::HHDM_REQUEST.response().expect("Fallo crítico: Sin HHDM").offset;
+
+    let hhdm_offset = crate::HHDM_REQUEST.response().expect("fatal: no HHDM").offset;
     let phys_mem_offset = x86_64::VirtAddr::new(hhdm_offset);
 
-    // EL SECRETO ESTÁ AQUÍ: Ignoramos CR3 y reconstruimos la tabla usando target_pml4
+    // Rebuild the mapper against the remote PML4 instead of reading CR3.
     let pml4_virt = phys_mem_offset + target_pml4.start_address().as_u64();
     let pml4 = unsafe { &mut *(pml4_virt.as_mut_ptr() as *mut PageTable) };
     let mut mapper = unsafe { OffsetPageTable::new(pml4, phys_mem_offset) };
 
     let page = Page::<Size4KiB>::containing_address(virtual_address);
-    
-    // Protección contra solapamiento de segmentos ELF
+
+    // Guard against overlapping ELF segments: leave the existing
+    // mapping intact and report success without re-allocating.
     if mapper.translate_page(page).is_ok() {
-        return Ok(()); 
+        return Ok(());
     }
-    
-    let frame_addr = crate::mm::memory::get_allocator().allocate_frame().ok_or("Out of memory")?;
+
+    let frame_addr = crate::mm::memory::get_allocator()
+        .allocate_frame()
+        .ok_or(crate::core::error::KernelError::Memory(
+            crate::core::error::MemoryError::OutOfFrames
+        ))?;
     let frame = PhysFrame::containing_address(x86_64::PhysAddr::new(frame_addr));
 
-    let flags = PageTableFlags::PRESENT 
-              | PageTableFlags::WRITABLE 
+    let flags = PageTableFlags::PRESENT
+              | PageTableFlags::WRITABLE
               | PageTableFlags::USER_ACCESSIBLE;
 
     let mut allocator = crate::mm::memory::SystemFrameAllocator;
-    
+
     unsafe {
         mapper.map_to(page, frame, flags, &mut allocator)
-            .map_err(|_| "Fallo al mapear la página remota")?
-            .flush(); // En tablas remotas el flush es inofensivo
-            
+            .map_err(|_| crate::core::error::KernelError::Memory(
+                crate::core::error::MemoryError::InvalidMapping
+            ))?
+            .flush();
+
         let hhdm_ptr = (phys_mem_offset + frame_addr).as_mut_ptr::<u8>();
         core::ptr::write_bytes(hhdm_ptr, 0, 4096);
     }
-    
+
     Ok(())
 }
 
-/// Traduce una dirección virtual buscando en una PML4 REMOTA específica.
+/// Translates a virtual address inside an arbitrary remote PML4.
+/// Used by the ELF loader to inspect user-space mappings before
+/// attaching them to the running address space.
 pub fn translate_in_pml4(
-    target_pml4: x86_64::structures::paging::PhysFrame, 
+    target_pml4: x86_64::structures::paging::PhysFrame,
     virtual_address: x86_64::VirtAddr
 ) -> Option<x86_64::PhysAddr> {
     use x86_64::structures::paging::{OffsetPageTable, PageTable};
-    
-    let hhdm_offset = crate::HHDM_REQUEST.response().expect("Fallo crítico: Sin HHDM").offset;
+
+    let hhdm_offset = crate::HHDM_REQUEST.response().expect("fatal: no HHDM").offset;
     let phys_mem_offset = x86_64::VirtAddr::new(hhdm_offset);
 
-    // Reconstruimos el traductor apuntando a la mente del proceso hijo
     let pml4_virt = phys_mem_offset + target_pml4.start_address().as_u64();
     let pml4 = unsafe { &mut *(pml4_virt.as_mut_ptr() as *mut PageTable) };
     let mapper = unsafe { OffsetPageTable::new(pml4, phys_mem_offset) };
 
     mapper.translate_addr(virtual_address)
 }
-// --- RECOLECCIÓN DE BASURA AVANZADA (GRIM REAPER) ---
 
-/// Recorre el árbol de paginación de una tarea muerta y libera
-/// estrictamente las páginas físicas que fueron asignadas al Espacio de Usuario.
+/// Walks the page-table tree of a defunct task and releases every
+/// physical frame owned by the user half (entries 0-255). The kernel
+/// half (entries 256-511) is intentionally never touched.
 pub unsafe fn destroy_user_address_space(pml4_frame: x86_64::structures::paging::PhysFrame) {
     use x86_64::structures::paging::{PageTable, PageTableFlags};
-    
-    let hhdm_offset = crate::HHDM_REQUEST.response().expect("Fallo crítico").offset;
+
+    let hhdm_offset = crate::HHDM_REQUEST.response().expect("fatal: no HHDM").offset;
     let phys_mem_offset = x86_64::VirtAddr::new(hhdm_offset);
 
-    // 1. Acceder a la PML4 (Nivel 4)
     let pml4_virt = phys_mem_offset + pml4_frame.start_address().as_u64();
     let pml4 = &mut *(pml4_virt.as_mut_ptr() as *mut PageTable);
 
-    // 2. Escaneamos SOLO la mitad inferior (User Space: entradas 0 a 255)
-    // La mitad superior (256 a 511) es el kernel y jamás debe tocarse.
     for p4_idx in 0..256 {
         let p4_entry = &pml4[p4_idx];
         if !p4_entry.is_unused() && p4_entry.flags().contains(PageTableFlags::USER_ACCESSIBLE) {
-            
+
             let pdpt_virt = phys_mem_offset + p4_entry.addr().as_u64();
             let pdpt = &mut *(pdpt_virt.as_mut_ptr() as *mut PageTable);
-            
+
             for p3_idx in 0..512 {
                 let p3_entry = &pdpt[p3_idx];
                 if !p3_entry.is_unused() && p3_entry.flags().contains(PageTableFlags::USER_ACCESSIBLE) {
-                    
-                    // SEGURIDAD CRÍTICA: ¿Es una página gigante de 1GB?
+
+                    // A 1 GiB huge page: free the frame and stop descending.
                     if p3_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
                         cow_deallocate_frame(p3_entry.addr().as_u64());
                         pdpt[p3_idx].set_unused();
-                        continue; // No intentamos bajar al siguiente nivel
+                        continue;
                     }
 
                     let pd_virt = phys_mem_offset + p3_entry.addr().as_u64();
                     let pd = &mut *(pd_virt.as_mut_ptr() as *mut PageTable);
-                    
+
                     for p2_idx in 0..512 {
                         let p2_entry = &pd[p2_idx];
                         if !p2_entry.is_unused() && p2_entry.flags().contains(PageTableFlags::USER_ACCESSIBLE) {
-                            
-                            // SEGURIDAD CRÍTICA: ¿Es una página gigante de 2MB?
+
+                            // A 2 MiB huge page: free the frame and stop descending.
                             if p2_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
                                 cow_deallocate_frame(p2_entry.addr().as_u64());
                                 pd[p2_idx].set_unused();
-                                continue; // No intentamos bajar al siguiente nivel
+                                continue;
                             }
 
-                            // Llegamos a la Tabla de Páginas Final (Nivel 1 - 4KB)
                             let pt_virt = phys_mem_offset + p2_entry.addr().as_u64();
                             let pt = &mut *(pt_virt.as_mut_ptr() as *mut PageTable);
-                            
+
                             for p1_idx in 0..512 {
                                 let p1_entry = &pt[p1_idx];
                                 if !p1_entry.is_unused() && p1_entry.flags().contains(PageTableFlags::USER_ACCESSIBLE) {
-                                    
-                                    // Liberamos la página de datos finales (Código, Stack, Heap de usuario)
+
                                     let phys_frame = p1_entry.addr().as_u64();
                                     cow_deallocate_frame(phys_frame);
-                                    
-                                    // Limpiamos la entrada para evitar referencias nulas/fantasmas
+
                                     pt[p1_idx].set_unused();
                                 }
                             }
-                            // Terminamos con esta tabla nivel 1, liberamos la tabla en sí misma
+                            // Done with this level-1 page table; release the frame that holds it.
                             cow_deallocate_frame(p2_entry.addr().as_u64());
                             pd[p2_idx].set_unused();
                         }
@@ -551,12 +595,14 @@ pub unsafe fn destroy_user_address_space(pml4_frame: x86_64::structures::paging:
         }
     }
 
-    // 3. Finalmente, destruimos el marco físico maestro (la propia PML4)
+    // Finally release the master PML4 frame itself.
     cow_deallocate_frame(pml4_frame.start_address().as_u64());
 }
 
-/// Crea una nueva PML4 clonando el espacio de Kernel y HHDM, aislando el Ring 3.
-/// Crea una nueva PML4 clonando el espacio de Kernel y HHDM, aislando el Ring 3.
+/// Allocates a new PML4 for a user task and seeds it with the kernel
+/// half plus any non-user mappings Limine provisioned (HHDM,
+/// framebuffer). User-mode entries are deliberately excluded so the
+/// task cannot reach other processes' address space.
 pub fn create_isolated_pml4() -> Option<x86_64::structures::paging::PhysFrame> {
     use x86_64::structures::paging::{PageTable, PageTableFlags, FrameAllocator};
     use x86_64::registers::control::Cr3;
@@ -564,30 +610,27 @@ pub fn create_isolated_pml4() -> Option<x86_64::structures::paging::PhysFrame> {
     let mut allocator = SystemFrameAllocator;
     let new_frame = allocator.allocate_frame()?;
 
-    let hhdm_offset = crate::HHDM_REQUEST.response().expect("Sin HHDM").offset;
+    let hhdm_offset = crate::HHDM_REQUEST.response().expect("fatal: no HHDM").offset;
     let phys_offset = x86_64::VirtAddr::new(hhdm_offset);
     let new_pml4_virt = phys_offset + new_frame.start_address().as_u64();
     let new_pml4 = unsafe { &mut *(new_pml4_virt.as_mut_ptr() as *mut PageTable) };
-    
-    // 1. Limpiamos toda la tabla. Terreno virgen.
+
+    // Start from a zeroed table.
     new_pml4.zero();
 
     let (current_pml4_frame, _) = Cr3::read();
     let current_pml4_virt = phys_offset + current_pml4_frame.start_address().as_u64();
     let current_pml4 = unsafe { &*(current_pml4_virt.as_ptr() as *const PageTable) };
 
-    // 2. Copiamos la mitad superior íntegra (Kernel Space estricto: 256 a 511)
+    // Copy the upper half verbatim (kernel space).
     for i in 256..512 {
         new_pml4[i] = current_pml4[i].clone();
     }
 
-    // 3. EL FILTRO QUIRÚRGICO (Mitad inferior: 0 a 255)
-    // Conservamos el HHDM y el Framebuffer de Limine, pero excluimos TODA
-    // la memoria que le pertenezca a un proceso de usuario (Ring 3).
+    // Lower half filter: keep only kernel-side entries (e.g. HHDM,
+    // framebuffer) and discard anything marked USER_ACCESSIBLE.
     for i in 0..256 {
         let entry = current_pml4[i].clone();
-        
-        // Si la entrada está en uso y NO tiene el flag de usuario, es del kernel/Limine. La copiamos.
         if !entry.is_unused() && !entry.flags().contains(PageTableFlags::USER_ACCESSIBLE) {
             new_pml4[i] = entry;
         }
@@ -596,12 +639,13 @@ pub fn create_isolated_pml4() -> Option<x86_64::structures::paging::PhysFrame> {
     Some(new_frame)
 }
 
+/// Pretty-prints the four-level translation chain for a virtual
+/// address, useful when debugging ELF loads or CoW faults.
 pub fn debug_page_tables(pml4_frame: x86_64::structures::paging::PhysFrame, vaddr: u64) {
     use x86_64::structures::paging::PageTable;
-    
-    let hhdm_offset = crate::HHDM_REQUEST.response().expect("Sin HHDM").offset;
-    
-    // Calculamos los índices para cada nivel
+
+    let hhdm_offset = crate::HHDM_REQUEST.response().expect("no HHDM").offset;
+
     let p4_idx = (vaddr >> 39) & 0x1FF;
     let p3_idx = (vaddr >> 30) & 0x1FF;
     let p2_idx = (vaddr >> 21) & 0x1FF;
@@ -609,25 +653,25 @@ pub fn debug_page_tables(pml4_frame: x86_64::structures::paging::PhysFrame, vadd
 
     let pml4_virt = pml4_frame.start_address().as_u64() + hhdm_offset;
     let pml4 = unsafe { &*(pml4_virt as *const PageTable) };
-    
-    crate::println!("--- DEBUG MMU PARA 0x{:X} ---", vaddr);
-    
+
+    crate::println!("--- DEBUG MMU for 0x{:X} ---", vaddr);
+
     let p4_entry = &pml4[p4_idx as usize];
     crate::println!("PML4[{}] -> Present: {}, Flags: {:?}", p4_idx, !p4_entry.is_unused(), p4_entry.flags());
     if p4_entry.is_unused() { return; }
-    
+
     let pdpt_virt = p4_entry.addr().as_u64() + hhdm_offset;
     let pdpt = unsafe { &*(pdpt_virt as *const PageTable) };
     let p3_entry = &pdpt[p3_idx as usize];
     crate::println!("PDPT[{}] -> Present: {}, Flags: {:?}", p3_idx, !p3_entry.is_unused(), p3_entry.flags());
     if p3_entry.is_unused() { return; }
-    
+
     let pd_virt = p3_entry.addr().as_u64() + hhdm_offset;
     let pd = unsafe { &*(pd_virt as *const PageTable) };
     let p2_entry = &pd[p2_idx as usize];
     crate::println!("PD[{}]   -> Present: {}, Flags: {:?}", p2_idx, !p2_entry.is_unused(), p2_entry.flags());
     if p2_entry.is_unused() { return; }
-    
+
     let pt_virt = p2_entry.addr().as_u64() + hhdm_offset;
     let pt = unsafe { &*(pt_virt as *const PageTable) };
     let p1_entry = &pt[p1_idx as usize];
@@ -635,13 +679,16 @@ pub fn debug_page_tables(pml4_frame: x86_64::structures::paging::PhysFrame, vadd
     crate::println!("-----------------------------");
 }
 
+/// Returns `true` when `addr` is mapped in the active page tables
+/// with the user bit set, walking the four levels manually with
+/// volatile reads (no `OffsetPageTable` construction in the hot path).
 pub fn is_user_page_mapped(addr: x86_64::VirtAddr) -> bool {
-    let hhdm_offset = crate::HHDM_REQUEST.response().expect("Fallo crítico: Sin HHDM").offset;
+    let hhdm_offset = crate::HHDM_REQUEST.response().expect("fatal: no HHDM").offset;
     let (pml4_frame, _) = x86_64::registers::control::Cr3::read();
-    
     let p4_phys = pml4_frame.start_address().as_u64();
-    
-    // Función anónima para leer 8 bytes físicos saltándose al compilador
+
+    // Read 8 bytes from physical memory via the HHDM window,
+    // bypassing compiler assumptions for MMIO-style paging reads.
     let read_entry = |phys_addr: u64, index: usize| -> u64 {
         let virt = phys_addr + hhdm_offset + (index as u64 * 8);
         unsafe { core::ptr::read_volatile(virt as *const u64) }
@@ -652,26 +699,26 @@ pub fn is_user_page_mapped(addr: x86_64::VirtAddr) -> bool {
     const HUGE: u64 = 1 << 7;
     const PHYS_MASK: u64 = 0x000FFFFF_FFFFF000;
 
-    // Nivel 4 (PML4)
+    // Level 4
     let p4_entry = read_entry(p4_phys, usize::from(addr.p4_index()));
     if p4_entry & PRESENT == 0 { return false; }
-    
-    // Nivel 3 (PDPT)
+
+    // Level 3
     let p3_phys = p4_entry & PHYS_MASK;
     let p3_entry = read_entry(p3_phys, usize::from(addr.p3_index()));
     if p3_entry & PRESENT == 0 { return false; }
     if p3_entry & HUGE != 0 { return (p3_entry & USER) != 0; }
 
-    // Nivel 2 (PD)
+    // Level 2
     let p2_phys = p3_entry & PHYS_MASK;
     let p2_entry = read_entry(p2_phys, usize::from(addr.p2_index()));
     if p2_entry & PRESENT == 0 { return false; }
     if p2_entry & HUGE != 0 { return (p2_entry & USER) != 0; }
 
-    // Nivel 1 (PT)
+    // Level 1
     let p1_phys = p2_entry & PHYS_MASK;
     let p1_entry = read_entry(p1_phys, usize::from(addr.p1_index()));
     if p1_entry & PRESENT == 0 { return false; }
-    
+
     (p1_entry & USER) != 0
 }

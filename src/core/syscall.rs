@@ -1,55 +1,76 @@
-// SPDX-FileCopyrightText: 2026 NWIN OS
-//
-// SPDX-License-Identifier: GPL-3.0-or-later
+//! Ring-3 to Ring-0 syscall dispatch.
+//!
+//! Programs the `syscall` MSRs (`STAR`, `LSTAR`, `SFMask`, `EFER.SCE`)
+//! with the GDT selectors and a kernel entry trampoline, installs a
+//! call gate for argument validation (zero-trust quarantine), and
+//! provides a typed dispatcher that converts `KernelError` to POSIX
+//! `errno` values before returning through `sysretq`.
 
 use x86_64::registers::model_specific::{Efer, EferFlags, Star, LStar, SFMask};
 use x86_64::registers::rflags::RFlags;
 use x86_64::VirtAddr;
+use crate::core::error::KernelError;
 
-// ========================================================
-// INFRAESTRUCTURA DE MEMORIA PARA SYSCALLS
-// ========================================================
-
+/// Top of the kernel stack used while servicing a syscall.
 #[no_mangle]
-pub static mut KERNEL_RSP: u64 = 0; 
+pub static mut KERNEL_RSP: u64 = 0;
+/// Scratch stack used by the asm trampoline to save the user RSP.
 #[no_mangle]
 pub static mut SCRATCH_RSP: u64 = 0;
 
+/// Snapshot of the user-supplied syscall arguments as they appeared on
+/// entry. Field order follows the Linux x86-64 ABI (`rdi rsi rdx r10
+/// r8 r9` plus `rax` for the syscall number).
 #[repr(C)]
 #[derive(Debug)]
 pub struct SyscallRegisters {
-    pub rax: u64, 
-    pub rdi: u64, 
-    pub rsi: u64, 
-    pub rdx: u64, 
-    pub r10: u64, 
-    pub r8:  u64, 
-    pub r9:  u64, 
+    pub rax: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub r10: u64,
+    pub r8: u64,
+    pub r9: u64,
 }
 
+/// Sole entry point that translates a `KernelError` into the negative
+/// POSIX `errno` value expected by `sysretq` and writes it into
+/// `regs.rax`.
+///
+/// Errors that do not yet have a `KernelError` variant (e.g. `EMFILE`)
+/// are kept inline as raw `-EINVAL as u64` until the appropriate
+/// variant is added to the error taxonomy.
+#[inline]
+fn syscall_return_err(regs: &mut SyscallRegisters, kernel_err: KernelError) {
+    // `to_errno()` already returns the negative `i32`; the cast to
+    // `u64` matches the `sysretq` ABI register width.
+    regs.rax = kernel_err.to_errno() as u64;
+}
+
+/// Enables the `syscall`/`sysretq` instructions and points the CPU
+/// at our handler trampoline. Must be called after `gdt::init` so the
+/// selectors are valid.
 pub fn init() {
     let selectors = &crate::core::gdt::GDT.1;
 
     unsafe {
         Efer::update(|flags| flags.insert(EferFlags::SYSTEM_CALL_EXTENSIONS));
-        
+
         Star::write(
-            selectors.user_code_selector,   
-            selectors.user_data_selector,   
-            selectors.kernel_code_selector, 
-            selectors.kernel_data_selector  
-        ).expect("Fallo crítico: No se pudo escribir en el MSR STAR");
+            selectors.user_code_selector,
+            selectors.user_data_selector,
+            selectors.kernel_code_selector,
+            selectors.kernel_data_selector,
+        ).expect("failed to write STAR MSR");
 
         LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
         SFMask::write(RFlags::INTERRUPT_FLAG);
     }
 }
 
-// ========================================================
-// EL ESCUDO ZERO-TRUST (Validación de Cuarentena)
-// ========================================================
-/// Verifica matemáticamente que un rango de memoria pertenece estrictamente
-/// a la mitad inferior del espacio virtual (Ring 3) y no cruza al Kernel.
+/// Zero-trust quarantine: verifies a `(ptr, len)` pair lies entirely
+/// in the lower half of the user address space and that every page
+/// it spans is currently mapped with user access.
 fn is_valid_user_memory(ptr: u64, len: usize) -> bool {
     if ptr == 0 { return false; }
     if len > (isize::MAX as usize) { return false; }
@@ -73,7 +94,7 @@ fn is_valid_user_memory(ptr: u64, len: usize) -> bool {
 }
 
 // ========================================================
-// EL GUARDIÁN (TRAMPOLÍN EN ENSAMBLADOR)
+// Asm trampoline (Guardian)
 // ========================================================
 #[unsafe(naked)]
 pub unsafe extern "C" fn syscall_entry() {
@@ -83,9 +104,9 @@ pub unsafe extern "C" fn syscall_entry() {
         "push qword ptr [rip + {scratch}]",
         "push rcx", "push r11", "push r9", "push r8",
         "push r10", "push rdx", "push rsi", "push rdi", "push rax",
-        
-        "mov rdi, rsp", 
-        
+
+        "mov rdi, rsp",
+
         "push r12",
         "mov r12, rsp",
         "and rsp, -16",
@@ -96,7 +117,7 @@ pub unsafe extern "C" fn syscall_entry() {
         "pop rax", "pop rdi", "pop rsi", "pop rdx", "pop r10",
         "pop r8", "pop r9", "pop r11", "pop rcx", "pop rsp",
         "sysretq",
-        
+
         scratch = sym SCRATCH_RSP,
         kernel_rsp = sym KERNEL_RSP,
         handle = sym handle_syscall_rust,
@@ -104,14 +125,14 @@ pub unsafe extern "C" fn syscall_entry() {
 }
 
 // ========================================================
-// MANEJADOR LÓGICO EN RUST
+// Rust-side dispatcher
 // ========================================================
 extern "C" fn handle_syscall_rust(regs: &mut SyscallRegisters) {
     match regs.rax {
-        0 => { // ABI de Linux: sys_read
-            let fd = regs.rdi as usize; 
-            let buffer_ptr = regs.rsi as *mut u8; 
-            let length = regs.rdx as usize; 
+        0 => { // Linux ABI: sys_read
+            let fd = regs.rdi as usize;
+            let buffer_ptr = regs.rsi as *mut u8;
+            let length = regs.rdx as usize;
 
             if !is_valid_user_memory(buffer_ptr as u64, length) {
                 regs.rax = (-14i64) as u64; // -EFAULT
@@ -120,7 +141,7 @@ extern "C" fn handle_syscall_rust(regs: &mut SyscallRegisters) {
 
             let mut is_stdin = false;
             let mut bytes_read = 0;
-            let mut error_code: i64 = 0; // AHORA ES UN ENTERO CON SIGNO
+            let mut error_code: i64 = 0;
 
             crate::task::with_task_manager(|tm| {
                 if let Some(task_id) = tm.current_task {
@@ -139,7 +160,7 @@ extern "C" fn handle_syscall_rust(regs: &mut SyscallRegisters) {
                                         *offset += read_bytes;
                                         bytes_read = read_bytes as u64;
                                     } else {
-                                        bytes_read = 0; 
+                                        bytes_read = 0;
                                     }
                                 }
                             }
@@ -149,7 +170,7 @@ extern "C" fn handle_syscall_rust(regs: &mut SyscallRegisters) {
             });
 
             if error_code != 0 {
-                regs.rax = error_code as u64; // Retorna el número negativo
+                regs.rax = error_code as u64;
                 return;
             }
 
@@ -165,22 +186,22 @@ extern "C" fn handle_syscall_rust(regs: &mut SyscallRegisters) {
                         let mut temp_buf = [0; 4];
                         let encoded = c.encode_utf8(&mut temp_buf);
                         let bytes_to_copy = core::cmp::min(encoded.len(), length);
-                        
+
                         user_slice[..bytes_to_copy].copy_from_slice(&encoded.as_bytes()[..bytes_to_copy]);
-                        regs.rax = bytes_to_copy as u64; 
+                        regs.rax = bytes_to_copy as u64;
                         break;
                     } else {
                         { x86_64::instructions::interrupts::enable_and_hlt(); }
-                        x86_64::instructions::interrupts::disable(); 
+                        x86_64::instructions::interrupts::disable();
                     }
                 }
             } else { regs.rax = 0; }
         },
 
-        1 => { // ABI de Linux: sys_write
-            let fd = regs.rdi as usize; 
-            let buffer_ptr = regs.rsi as *const u8; 
-            let length = regs.rdx as usize; 
+        1 => { // Linux ABI: sys_write
+            let fd = regs.rdi as usize;
+            let buffer_ptr = regs.rsi as *const u8;
+            let length = regs.rdx as usize;
 
             if !is_valid_user_memory(buffer_ptr as u64, length) {
                 regs.rax = (-14i64) as u64; // -EFAULT
@@ -218,13 +239,13 @@ extern "C" fn handle_syscall_rust(regs: &mut SyscallRegisters) {
                 }
             });
 
-            if error_code != 0 { regs.rax = error_code as u64; } 
+            if error_code != 0 { regs.rax = error_code as u64; }
             else { regs.rax = bytes_written; }
         },
 
-        2 => { // ABI de Linux: sys_open
-            let filename_ptr = regs.rdi as *const u8; 
-            
+        2 => { // Linux ABI: sys_open
+            let filename_ptr = regs.rdi as *const u8;
+
             if !is_valid_user_memory(filename_ptr as u64, 256) {
                 regs.rax = (-14i64) as u64; // -EFAULT
                 return;
@@ -244,26 +265,26 @@ extern "C" fn handle_syscall_rust(regs: &mut SyscallRegisters) {
 
             if let Some(file_vnode) = crate::fs::vfs::open_vnode(filename) {
                 let mut new_fd = 0;
-                
+
                 crate::task::with_task_manager(|tm| {
                     if let Some(task_id) = tm.current_task {
                         if let Some(task) = tm.task_registry.get_mut(&task_id) {
                             new_fd = task.fd_table.insert(crate::fs::fd::FileDescriptor::RegularFile {
                                 vnode: file_vnode,
-                                offset: 0, 
+                                offset: 0,
                             });
                         }
                     }
                 });
 
-                if new_fd > 0 { regs.rax = new_fd as u64; } 
+                if new_fd > 0 { regs.rax = new_fd as u64; }
                 else { regs.rax = (-24i64) as u64; } // -EMFILE
             } else {
                 regs.rax = (-2i64) as u64; // -ENOENT
             }
         },
 
-        3 => { // ABI de Linux: sys_close
+        3 => { // Linux ABI: sys_close
             let fd = regs.rdi as usize;
             let mut error_code: i64 = 0;
 
@@ -280,50 +301,46 @@ extern "C" fn handle_syscall_rust(regs: &mut SyscallRegisters) {
             regs.rax = if error_code == 0 { 0 } else { error_code as u64 };
         },
 
-        9 => { // ABI de Linux: sys_mmap
+        9 => { // Linux ABI: sys_mmap
             let addr = regs.rdi;
             let length = regs.rsi;
             let flags = regs.r10;
 
-            // Para la Fase 3.1, los asignadores de memoria de Ring 3 (como malloc) 
-            // exigen memoria anónima y privada (MAP_PRIVATE | MAP_ANONYMOUS = 0x22).
+            // User-space allocators (e.g. glibc malloc) need anonymous
+            // private memory. File-backed mappings are not yet wired.
             if (flags & 0x20) == 0 {
-                regs.rax = (-22i64) as u64; // -EINVAL (Aún no mapeamos archivos al VFS)
+                regs.rax = (-22i64) as u64; // -EINVAL
                 return;
             }
 
-            let mut ret_val = (-12i64) as u64; // Default: -ENOMEM
+            let mut ret_val = (-12i64) as u64; // default -ENOMEM
 
             crate::task::with_task_manager(|tm| {
                 if let Some(task_id) = tm.current_task {
                     if let Some(task) = tm.task_registry.get_mut(&task_id) {
-                        
-                        // Alinear la longitud solicitada al siguiente múltiplo de 4KB
-                        let alloc_size = (length + 0xFFF) & !0xFFF; 
-                        
-                        // Si el usuario pide addr 0, el kernel decide dónde ponerlo
+
+                        let alloc_size = (length + 0xFFF) & !0xFFF;
+
                         let start_addr = if addr != 0 { addr } else { task.mmap_base };
-                        
-                        // Validar límites de seguridad de Ring 3
+
                         if start_addr >= 0x1000 && start_addr.saturating_add(alloc_size) <= 0x00007FFFFFFFFFFF {
                             let pages = alloc_size / 4096;
-                            let mut success = true;
                             let target_pml4 = task.pml4_frame;
 
                             for i in 0..pages {
                                 let virt_addr = x86_64::VirtAddr::new(start_addr + (i * 4096));
-                                if crate::mm::memory::allocate_and_map_user_page(target_pml4, virt_addr).is_err() {
-                                    success = false;
-                                    break;
+                                // Propagate any allocation/mapping error back
+                                // to the caller via the typed syscall helper.
+                                if let Err(kernel_err) = crate::mm::memory::allocate_and_map_user_page(target_pml4, virt_addr) {
+                                    syscall_return_err(regs, kernel_err);
+                                    return;
                                 }
                             }
 
-                            if success {
-                                if addr == 0 {
-                                    task.mmap_base += alloc_size; // Mover el puntero para la siguiente llamada
-                                }
-                                ret_val = start_addr;
+                            if addr == 0 {
+                                task.mmap_base += alloc_size; // advance the cursor
                             }
+                            ret_val = start_addr;
                         }
                     }
                 }
@@ -335,20 +352,20 @@ extern "C" fn handle_syscall_rust(regs: &mut SyscallRegisters) {
         12 => { // ABI de Linux: sys_brk
             // sys_brk no suele retornar códigos de error negativos estándar en caso de fallo,
             // simplemente devuelve el program_break actual o inmodificado.
-            let requested_brk = regs.rdi; 
+            let requested_brk = regs.rdi;
             let current_task_id = crate::task::TASK_MANAGER.lock().current_task;
-            
+
             if let Some(task_id) = current_task_id {
                 let mut tm = crate::task::TASK_MANAGER.lock();
                 if let Some(task) = tm.task_registry.get_mut(&task_id) {
-                    
+
                     if requested_brk == 0 {
                         regs.rax = task.program_break;
                         return;
                     }
 
                     if requested_brk < task.heap_start || requested_brk >= 0x700000000000 {
-                        regs.rax = task.program_break; 
+                        regs.rax = task.program_break;
                         return;
                     }
 
@@ -357,9 +374,9 @@ extern "C" fn handle_syscall_rust(regs: &mut SyscallRegisters) {
 
                     if new_page_end > current_page_end {
                         let pages_to_allocate = (new_page_end - current_page_end) / 0x1000;
-                        let mut success = true;
                         let target_pml4 = task.pml4_frame;
-                        
+
+                        let mut success = true;
                         for i in 0..pages_to_allocate {
                             let virt_addr = x86_64::VirtAddr::new(current_page_end + (i * 0x1000));
                             if crate::mm::memory::allocate_and_map_user_page(target_pml4, virt_addr).is_err() {
@@ -382,11 +399,11 @@ extern "C" fn handle_syscall_rust(regs: &mut SyscallRegisters) {
             } else { regs.rax = 0; }
         },
 
-        59 => { // ABI de Linux: sys_execve
+        59 => { // Linux ABI: sys_execve
             let filename_ptr = regs.rdi as *const u8;
-            let args_ptr = regs.rsi as *const u8;   
-            let args_len = regs.rdx as usize;       
-            
+            let args_ptr = regs.rsi as *const u8;
+            let args_len = regs.rdx as usize;
+
             if !is_valid_user_memory(filename_ptr as u64, 64) {
                 regs.rax = (-14i64) as u64; // -EFAULT
                 return;
@@ -395,7 +412,7 @@ extern "C" fn handle_syscall_rust(regs: &mut SyscallRegisters) {
                 regs.rax = (-14i64) as u64; // -EFAULT
                 return;
             }
-                
+
             let mut filename_buf = [0u8; 64];
             let mut len = 0;
             unsafe {
@@ -407,27 +424,35 @@ extern "C" fn handle_syscall_rust(regs: &mut SyscallRegisters) {
                 }
             }
             let filename = core::str::from_utf8(&filename_buf[..len]).unwrap_or("");
-        
+
             let mut args_buf = alloc::vec::Vec::new();
             if args_len > 0 && args_len < 4096 {
                 args_buf.resize(args_len, 0);
                 unsafe { core::ptr::copy_nonoverlapping(args_ptr, args_buf.as_mut_ptr(), args_len); }
             } else {
                 args_buf.extend_from_slice(filename.as_bytes());
-                args_buf.push(0); 
+                args_buf.push(0);
             }
 
             if let Some(elf_slice) = crate::fs::vfs::find_file(filename) {
                 if let Some(target_pml4) = crate::mm::memory::create_isolated_pml4() {
-                    let load_result = crate::task::elf::load_elf(elf_slice, target_pml4);
+                    // load_elf returns ElfError; From<ElfError> for
+                    // KernelError lifts it into the root taxonomy.
+                    let load_result: Result<u64, KernelError> =
+                        crate::task::elf::load_elf(elf_slice, target_pml4)
+                            .map_err(|e| e.into());
 
                     let user_stack_base = 0x7FFFF0000000;
                     let mut user_stack_top = user_stack_base + 0x1000;
-                    let _ = crate::mm::memory::allocate_and_map_user_page(
+
+                    if let Err(kernel_err) = crate::mm::memory::allocate_and_map_user_page(
                         target_pml4,
                         x86_64::VirtAddr::new(user_stack_base)
-                    );
-                    
+                    ) {
+                        syscall_return_err(regs, kernel_err);
+                        return;
+                    }
+
                     unsafe {
                         let (old_pml4, cr3_flags) = x86_64::registers::control::Cr3::read();
                         x86_64::registers::control::Cr3::write(target_pml4, cr3_flags);
@@ -439,7 +464,7 @@ extern "C" fn handle_syscall_rust(regs: &mut SyscallRegisters) {
                         let mut argv_pointers = alloc::vec::Vec::new();
                         let mut current_ptr = strings_base;
                         let mut is_new_arg = true;
-                        
+
                         let args_slice = args_buf.as_slice();
                         for i in 0..args_slice.len() {
                             if args_slice[i] == 0 {
@@ -450,7 +475,7 @@ extern "C" fn handle_syscall_rust(regs: &mut SyscallRegisters) {
                             }
                             current_ptr += 1;
                         }
-                        
+
                         let argc = argv_pointers.len() as u64;
                         user_stack_top &= !0xF;
 
@@ -473,24 +498,24 @@ extern "C" fn handle_syscall_rust(regs: &mut SyscallRegisters) {
                             crate::task::with_task_manager(|tm| {
                                 match tm.spawn_dynamic(entry_fn, target_pml4, user_stack_top) {
                                     Ok(id) => { regs.rax = id.0; },
-                                    Err(e) => {
-                                        crate::serial_println!("[ERROR] Spawn failed: {:?}", e);
-                                        regs.rax = (-11i64) as u64; // -EAGAIN
+                                    Err(kernel_err) => {
+                                        crate::serial_println!("[ERROR] Spawn failed: {}", kernel_err);
+                                        syscall_return_err(regs, kernel_err);
                                     }
                                 }
                             });
                         },
-                        Err(e) => { 
-                            crate::serial_println!("[ERROR] ELF load failed: {:?}", e);
-                            regs.rax = (-8i64) as u64; // -ENOEXEC
+                        Err(kernel_err) => {
+                            crate::serial_println!("[ERROR] ELF load failed: {}", kernel_err);
+                            syscall_return_err(regs, kernel_err);
                         }
                     }
                 } else { regs.rax = (-12i64) as u64; /* -ENOMEM */ }
             } else { regs.rax = (-2i64) as u64; /* -ENOENT */ }
         },
 
-        61 => { // ABI de Linux: sys_wait4
-            let pid = regs.rdi; 
+        61 => { // Linux ABI: sys_wait4
+            let pid = regs.rdi;
             let mut will_block = false;
 
             crate::task::with_task_manager(|tm| {
@@ -499,38 +524,38 @@ extern "C" fn handle_syscall_rust(regs: &mut SyscallRegisters) {
 
             if will_block {
                 unsafe { crate::task::scheduler::schedule(); }
-                regs.rax = pid; 
+                regs.rax = pid;
             } else {
-                regs.rax = (-10i64) as u64; // -ECHILD 
+                regs.rax = (-10i64) as u64; // -ECHILD
             }
         },
-        
-        60 => { // ABI de Linux: sys_exit
+
+        60 => { // Linux ABI: sys_exit
             crate::task::with_task_manager(|tm| {
                 tm.exit_current_task();
             });
             loop { { x86_64::instructions::interrupts::enable_and_hlt(); } }
         },
 
-        88 => { // ACPI Poweroff / QEMU Exit
+        88 => { // ACPI poweroff / QEMU exit
             unsafe {
                 let mut port_debug = x86_64::instructions::port::Port::<u32>::new(0xf4);
-                port_debug.write(0x10); 
-                
+                port_debug.write(0x10);
+
                 let mut port_a = x86_64::instructions::port::Port::<u16>::new(0x604);
-                port_a.write(0x2000); 
+                port_a.write(0x2000);
             }
             loop { x86_64::instructions::interrupts::enable_and_hlt(); }
         },
 
-        500 => { // ABI de NWIN OS: Syscall 500
+        500 => { // NWIN OS syscall 500: clear the framebuffer
             x86_64::instructions::interrupts::without_interrupts(|| {
                 if let Some(writer) = crate::drivers::display::WRITER.lock().as_mut() {
                     writer.clear_screen();
                     writer.reset_cursor();
                 }
             });
-            regs.rax = 0; 
+            regs.rax = 0;
         },
 
         _ => { regs.rax = (-38i64) as u64; /* -ENOSYS */ }

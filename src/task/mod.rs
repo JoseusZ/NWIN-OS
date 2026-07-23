@@ -45,32 +45,46 @@ pub fn init_multitasking() {
     }
 
     // INICIALIZACIÓN CENTRAL (EL BIG BANG DE LAS TAREAS)
+    //
+    // Fase 7: las 4 ramas de panic usan Display `{}` en lugar de Debug
+    // `{:?}` para mantener consistencia con la Fase 5 (panic_handler) y
+    // para que el KernelError se imprima con su formato legible de campo
+    // (`KERNEL:TASK:StackAllocation (64 KiB heap reservation failed)`)
+    // en vez del volcado Rust crudo.
     crate::task::with_task_manager(|tm| {
         if let Err(e) = tm.spawn(hilo_segador, current_pml4, crate::task::PrivilegeLevel::KernelMode) {
-            panic!("FATAL: Failed to spawn Reaper daemon. Error: {:?}", e);
+            panic!("FATAL: Failed to spawn Reaper daemon. Error: {}", e);
         }
 
-        let nombre_archivo = "shell.elf"; 
+        let nombre_archivo = "shell.elf";
         if let Some(elf_slice) = crate::fs::vfs::find_file(nombre_archivo) {
             if let Some(target_pml4) = crate::mm::memory::create_isolated_pml4() {
-                
-                let load_result = crate::task::elf::load_elf(elf_slice, target_pml4);
+
+                // Fase 7: load_elf sigue devolviendo ElfError; usamos
+                // `.into()` (que activa From<ElfError> for KernelError,
+                // Fase 2.1) en lugar de re-empaquetar manualmente con
+                // SystemError::ElfParseFailed. El resultado en rax / log
+                // es equivalente (el kernel_err -> to_errno produce -ENOEXEC),
+                // pero el codigo es mas limpio y aprovecha la taxonomia
+                // consolidada: el ElfError se canaliza ahora como
+                // FsError::Elf (que es el envoltorio canonico desde Fase 1.5).
+                let load_result: Result<u64, crate::core::error::KernelError> =
+                    crate::task::elf::load_elf(elf_slice, target_pml4)
+                        .map_err(|e| e.into());
+
                 let user_stack_base = 0x800000;
                 let user_stack_top = user_stack_base + 0x1000;
                 let _ = crate::mm::memory::allocate_and_map_user_page(target_pml4, x86_64::VirtAddr::new(user_stack_base));
-                
+
                 match load_result {
                     Ok(entry_point) => {
                         let entry_fn: fn() -> ! = unsafe { ::core::mem::transmute(entry_point as usize) };
                         match tm.spawn_dynamic(entry_fn, target_pml4, user_stack_top) {
                             Ok(_) => crate::serial_println!("[OK] User Shell deployed and queued for Ring 3."),
-                            Err(e) => panic!("FATAL: Failed to spawn Shell task. Error: {:?}", e),
+                            Err(e) => panic!("FATAL: Failed to spawn Shell task. Error: {}", e),
                         }
                     },
-                    Err(e) => { 
-                        let sys_err = crate::core::error::KernelError::System(crate::core::error::SystemError::ElfParseFailed(e));
-                        panic!("FATAL: Failed to parse shell.elf. Error: {:?}", sys_err); 
-                    }
+                    Err(e) => panic!("FATAL: Failed to parse shell.elf. Error: {}", e),
                 }
             } else { panic!("FATAL: Out of memory. Could not isolate PML4 for Shell."); }
         } else { panic!("FATAL: '{}' not found in Initramfs TAR.", nombre_archivo); }

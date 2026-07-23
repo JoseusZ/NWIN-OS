@@ -69,8 +69,15 @@ impl Task {
         let mut stack_vec = alloc::vec::Vec::new();
 
         // 2. Erradicamos el bucle de muerte. Devolvemos el error estructurado.
+        //
+        // Fase 7: usamos `TaskError::StackAllocation` (declarado en Fase 1.6)
+        // en lugar del legacy bridge `SystemError::TaskCreationFailure`. La
+        // conversion `From<TaskError> for KernelError` (Fase 2.1) se activa
+        // automaticamente al envolver.
         if stack_vec.try_reserve_exact(STACK_SIZE).is_err() {
-            return Err(crate::core::error::KernelError::System(crate::core::error::SystemError::TaskCreationFailure));
+            return Err(crate::core::error::KernelError::Task(
+                crate::core::error::TaskError::StackAllocation
+            ));
         }
 
         stack_vec.resize(STACK_SIZE, 0);

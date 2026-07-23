@@ -2,6 +2,14 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Virtual File System core: the [`VNode`] trait, the in-memory TAR
+//! reader used for the initramfs, the POSIX-style path resolver and
+//! the mount table.
+//!
+//! Drivers for FAT and ext4 attach themselves by mounting a root
+//! [`VNode`] into [`MOUNT_TABLE`]; from that point on
+//! [`resolve_path`] transparently crosses mount points.
+
 use core::str;
 use spin::Mutex;
 use lazy_static::lazy_static;
@@ -9,49 +17,68 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 
 // ====================================================================
-// ESTRUCTURAS DE SEGURIDAD PARA CONCURRENCIA
+// CONCURRENCY SAFETY PRIMITIVES
 // ====================================================================
 
-// --- Envoltorio para hacer el puntero crudo seguro entre hilos ---
-// Como los punteros crudos (*const u8) no implementan Send ni Sync por defecto,
-// el compilador nos prohíbe usarlos en variables globales (lazy_static).
-// Al crear esta estructura y prometerle a Rust que nosotros controlaremos
-// el acceso mediante un Mutex, evitamos el error E0277.
+// Raw pointers (*const u8) do not implement Send or Sync by default,
+// which prevents storing them in a `lazy_static!` global. Wrapping
+// the pointer in `TarContext` and explicitly promising the compiler
+// that access is synchronised through a Mutex removes the E0277
+// error without compromising safety.
 
+/// A virtual filesystem node: the common interface every filesystem
+/// driver (TAR, FAT, ext4, …) implements.
 pub trait VNode: Send + Sync {
-    // --- FILE OPERATIONS ---
+    /// Reads up to `buf.len()` bytes starting at `offset`.
+    ///
+    /// Returns the number of bytes actually copied; `0` signals EOF
+    /// or an out-of-bounds offset.
     fn read(&self, _offset: usize, _buf: &mut [u8]) -> usize { 0 }
+
+    /// Total size of the underlying data in bytes.
     fn get_size(&self) -> usize { 0 }
 
-    // --- DIRECTORY OPERATIONS ---
+    /// Whether this node represents a directory.
     fn is_dir(&self) -> bool { false }
-    
-    /// Searches for a child node by name within this directory.
+
+    /// Looks up a child node by name within this directory.
     fn lookup(&self, _name: &str) -> Option<alloc::sync::Arc<dyn VNode>> { None }
 }
 
 
+/// Raw pointer + length bundle pointing at the initramfs TAR image
+/// supplied by Limine.
 #[derive(Clone, Copy)]
 pub struct TarContext {
     pub ptr: *const u8,
     pub size: usize,
 }
 
+// Safety: every read of the initramfs goes through a Mutex in
+// `INITRAMFS`, so concurrent access is synchronised.
 unsafe impl Send for TarContext {}
 unsafe impl Sync for TarContext {}
 
 // ====================================================================
-// BÓVEDA GLOBAL DEL SISTEMA DE ARCHIVOS VIRTUAL (VFS)
+// GLOBAL VFS VAULT
 // ====================================================================
 
 lazy_static! {
+    /// Address and size of the initramfs TAR, or `None` until
+    /// [`init`] is called from `main.rs`.
     pub static ref INITRAMFS: Mutex<Option<TarContext>> = Mutex::new(None);
+    /// Maps absolute paths (`"/"`, `"/mnt"`, …) to the root [`VNode`]
+    /// of every filesystem mounted into the VFS.
     pub static ref MOUNT_TABLE: MountTable = MountTable::new();
+    /// In-memory tree built by [`build_vfs_tree_from_tar`] before any
+    /// real disk driver attaches.
     pub static ref VFS_ROOT: alloc::sync::Arc<DirVNode> = alloc::sync::Arc::new(DirVNode::new());
 }
 
-/// Guarda la dirección del Initramfs durante el arranque del sistema.
-/// Debe llamarse una sola vez desde `main.rs`.
+/// Stores the initramfs address for the rest of the boot sequence.
+///
+/// Must be called exactly once from `main.rs` before any
+/// [`find_file`] / [`build_vfs_tree_from_tar`] invocation.
 pub fn init(tar_address: *const u8, tar_size: usize) {
     *INITRAMFS.lock() = Some(TarContext {
         ptr: tar_address,
@@ -60,63 +87,64 @@ pub fn init(tar_address: *const u8, tar_size: usize) {
 }
 
 // ====================================================================
-// LÓGICA DE BÚSQUEDA Y LECTURA
+// LOOKUP AND READ LOGIC
 // ====================================================================
 
-/// Busca un archivo por su nombre dentro del archivo TAR global cargado en memoria.
-/// Retorna un *slice* (porción de memoria) con el contenido exacto del archivo.
+/// Searches the initramfs TAR for `filename` and returns the raw
+/// bytes of its payload, or `None` when the file is missing or the
+/// VFS has not been initialised yet.
 pub fn find_file(filename: &str) -> Option<&'static [u8]> {
     let initramfs = INITRAMFS.lock();
-    
-    // Si el disco RAM ya fue inicializado, procedemos a buscar
+
     if let Some(tar_ctx) = *initramfs {
         let mut offset = 0;
 
         while offset + 512 <= tar_ctx.size {
-            // La cabecera TAR es de 512 bytes
+            // TAR entries always start with a 512-byte header.
             let header_ptr = unsafe { tar_ctx.ptr.add(offset) };
             let header = unsafe { core::slice::from_raw_parts(header_ptr, 512) };
 
-            // Si el primer byte es 0, llegamos al final del archivo TAR
+            // A zeroed first byte marks the end of the TAR stream.
             if header[0] == 0 {
                 break;
             }
 
-            // 1. Extraer el nombre del archivo (Los primeros 100 bytes)
-            // Buscamos dónde termina el texto (el primer byte nulo '\0')
+            // 1. Read the file name (first 100 bytes, NUL-terminated).
             let name_len = header[0..100].iter().position(|&c| c == 0).unwrap_or(100);
             let current_filename = core::str::from_utf8(&header[0..name_len]).unwrap_or("");
 
-            // 2. Extraer el tamaño del archivo (Bytes 124 a 135, en formato Octal ASCII)
-            let size_bytes = &header[124..135]; // Leemos 11 bytes (el 12º es el nulo)
+            // 2. Read the size (bytes 124..135, octal ASCII).
+            let size_bytes = &header[124..135]; // 11 bytes + NUL terminator
             let size_str = core::str::from_utf8(size_bytes).unwrap_or("0").trim();
             let file_size = usize::from_str_radix(size_str, 8).unwrap_or(0);
 
-            // 3. Calcular dónde empiezan los datos reales
+            // 3. Compute the data offset.
             let data_start = offset + 512;
 
-            // ¿Es este el archivo que buscamos?
+            // Match?
             if current_filename == filename {
                 let data_ptr = unsafe { tar_ctx.ptr.add(data_start) };
                 let data_slice = unsafe { core::slice::from_raw_parts(data_ptr, file_size) };
                 return Some(data_slice);
             }
 
-            // 4. Saltar al siguiente archivo
-            // Los datos siempre ocupan bloques completos de 512 bytes, aunque sobren bytes.
-            let data_blocks = (file_size + 511) / 512; 
+            // 4. Advance to the next entry (payload rounded up to 512).
+            let data_blocks = (file_size + 511) / 512;
             offset += 512 + (data_blocks * 512);
         }
     }
 
-    None // Archivo no encontrado o VFS no inicializado
+    None
 }
 
+/// Read-only [`VNode`] backed by a slice of initramfs memory.
 pub struct TarVNode {
     data: &'static [u8],
 }
 
 impl TarVNode {
+    /// Builds a TAR-backed node from the byte slice returned by
+    /// [`find_file`].
     pub fn new(data: &'static [u8]) -> Self {
         Self { data }
     }
@@ -124,14 +152,14 @@ impl TarVNode {
 
 impl VNode for TarVNode {
     fn read(&self, offset: usize, buf: &mut [u8]) -> usize {
-        // Prevent reading out of bounds
+        // Refuse out-of-bounds reads.
         if offset >= self.data.len() {
             return 0;
         }
-        
+
         let available = self.data.len() - offset;
         let bytes_to_copy = core::cmp::min(buf.len(), available);
-        
+
         buf[..bytes_to_copy].copy_from_slice(&self.data[offset..offset + bytes_to_copy]);
         bytes_to_copy
     }
@@ -141,24 +169,30 @@ impl VNode for TarVNode {
     }
 }
 
-/// Opens a file and returns it as a standardized Virtual Node.
-/// This abstracts the RAM implementation away from the Syscall handler.
-/// Abre un archivo utilizando el motor de resolución de rutas POSIX.
+/// Opens a file and returns it as a standardised Virtual Node.
+///
+/// Thin wrapper around [`resolve_path`] used by the syscall layer so
+/// the rest of the kernel does not need to know how paths are
+/// resolved.
 pub fn open_vnode(path: &str) -> Option<alloc::sync::Arc<dyn VNode>> {
     resolve_path(path)
 }
+
+/// In-memory directory node used by the TAR initramfs and as the
+/// default root when no disk is mounted at `"/"`.
 pub struct DirVNode {
     children: Mutex<BTreeMap<String, alloc::sync::Arc<dyn VNode>>>,
 }
 
 impl DirVNode {
+    /// Creates an empty directory node.
     pub fn new() -> Self {
         Self {
             children: Mutex::new(BTreeMap::new()),
         }
     }
 
-    /// Mounts or adds a new child node to this directory.
+    /// Inserts (or replaces) a child node by name.
     pub fn add(&self, name: &str, node: alloc::sync::Arc<dyn VNode>) {
         self.children.lock().insert(String::from(name), node);
     }
@@ -166,7 +200,7 @@ impl DirVNode {
 
 impl VNode for DirVNode {
     fn is_dir(&self) -> bool { true }
-    
+
     fn lookup(&self, name: &str) -> Option<alloc::sync::Arc<dyn VNode>> {
         self.children.lock().get(name).cloned()
     }
@@ -174,11 +208,16 @@ impl VNode for DirVNode {
 
 
 // ====================================================================
-// PATH RESOLUTION ENGINE (NIVEL POSIX)
+// PATH RESOLUTION ENGINE (POSIX-STYLE)
 // ====================================================================
 
+/// Resolves an absolute POSIX path against the live mount table and
+/// the in-memory tree.
+///
+/// Returns `None` if any component of the path is missing or if a
+/// non-directory is traversed as a directory.
 pub fn resolve_path(path: &str) -> Option<alloc::sync::Arc<dyn VNode>> {
-    // 1. Inicia desde la raíz. 
+    // 1. Start at the mounted root or fall back to the TAR tree.
     let mut current: alloc::sync::Arc<dyn VNode> = MOUNT_TABLE.get_mount("/")
         .unwrap_or_else(|| VFS_ROOT.clone());
 
@@ -187,23 +226,25 @@ pub fn resolve_path(path: &str) -> Option<alloc::sync::Arc<dyn VNode>> {
 
     for part in parts {
         if !current.is_dir() {
-            return None; // Intentamos entrar a un archivo como si fuera carpeta
+            return None; // tried to descend into a file
         }
-        
-        // Reconstruimos la ruta paso a paso para revisar puntos de montaje
+
+        // Rebuild the path incrementally so mount points can be
+        // intercepted at every level.
         current_path.push('/');
         current_path.push_str(part);
 
-        // 2. INTERCEPCIÓN POSIX: ¿Hay un disco anclado en esta carpeta exacta?
+        // 2. POSIX interception: if a disk is mounted on this exact
+        //    path, cross the boundary into it.
         if let Some(mounted_node) = MOUNT_TABLE.get_mount(&current_path) {
-            current = mounted_node; // Cruzamos la frontera al nuevo disco
+            current = mounted_node;
             continue;
         }
 
-        // 3. Si no hay disco anclado, buscamos el archivo/carpeta de forma normal
+        // 3. No mount boundary: walk the in-memory tree.
         match current.lookup(part) {
             Some(next_node) => current = next_node,
-            None => return None, // El archivo/carpeta no existe
+            None => return None, // path does not resolve
         }
     }
 
@@ -211,75 +252,81 @@ pub fn resolve_path(path: &str) -> Option<alloc::sync::Arc<dyn VNode>> {
 }
 
 // ====================================================================
-// TABLA DE PUNTOS DE MONTAJE (MOUNT TABLE)
+// MOUNT TABLE
 // ====================================================================
 
+/// Thread-safe map of absolute paths to mounted filesystem roots.
 pub struct MountTable {
     mounts: spin::Mutex<alloc::collections::BTreeMap<alloc::string::String, alloc::sync::Arc<dyn VNode>>>,
 }
 
 impl MountTable {
+    /// Creates an empty mount table.
     pub fn new() -> Self {
         Self {
             mounts: spin::Mutex::new(alloc::collections::BTreeMap::new()),
         }
     }
 
-    /// Ancla un VNode (Sistema de archivos entero) a una ruta específica.
+    /// Anchors a [`VNode`] (a whole filesystem tree) at `path`,
+    /// making it visible to [`resolve_path`].
     pub fn mount(&self, path: &str, node: alloc::sync::Arc<dyn VNode>) {
         self.mounts.lock().insert(alloc::string::String::from(path), node);
     }
 
-    /// Busca si existe un sistema de archivos montado en esta ruta exacta.
+    /// Returns the [`VNode`] mounted at `path`, if any.
     pub fn get_mount(&self, path: &str) -> Option<alloc::sync::Arc<dyn VNode>> {
         self.mounts.lock().get(path).cloned()
     }
 
-    /// Desmonta un VNode, liberando el punto de anclaje. VITAL para pivot_root.
+    /// Removes the mount at `path`, returning `true` when something
+    /// was actually unmounted. Required for `pivot_root`.
     pub fn unmount(&self, path: &str) -> bool {
         self.mounts.lock().remove(path).is_some()
     }
 }
 
-/// Escanea el archivo TAR en RAM y construye el árbol de directorios inicial en VFS_ROOT.
+/// Walks the initramfs TAR image and registers every non-empty file
+/// as a [`TarVNode`] under [`VFS_ROOT`].
 pub fn build_vfs_tree_from_tar() {
     let initramfs = INITRAMFS.lock();
-    
+
     if let Some(tar_ctx) = *initramfs {
         let mut offset = 0;
-        
+
         while offset + 512 <= tar_ctx.size {
             let header_ptr = unsafe { tar_ctx.ptr.add(offset) };
             let header = unsafe { core::slice::from_raw_parts(header_ptr, 512) };
-            
-            // Fin del archivo TAR
+
+            // End-of-archive marker.
             if header[0] == 0 { break; }
 
-            // Extraer nombre
+            // Read name.
             let name_len = header[0..100].iter().position(|&c| c == 0).unwrap_or(100);
             let current_filename = core::str::from_utf8(&header[0..name_len]).unwrap_or("");
 
-            // Extraer tamaño
+            // Read size.
             let size_bytes = &header[124..135];
             let size_str = core::str::from_utf8(size_bytes).unwrap_or("0").trim();
             let file_size = usize::from_str_radix(size_str, 8).unwrap_or(0);
 
             let data_start = offset + 512;
-            
-            // Si es un archivo válido, lo encapsulamos en un VNode y lo anclamos a la raíz
+
+            // Register every valid, non-empty file at the TAR root.
             if file_size > 0 && !current_filename.is_empty() {
                 let data_ptr = unsafe { tar_ctx.ptr.add(data_start) };
                 let data_slice = unsafe { core::slice::from_raw_parts(data_ptr, file_size) };
-                
+
                 let vnode = alloc::sync::Arc::new(TarVNode::new(data_slice));
-                
-                // Limpiamos barras iniciales por si el TAR las incluye (ej. "/shell.elf" -> "shell.elf")
+
+                // Strip a leading slash so entries like "/shell.elf"
+                // become "shell.elf" and fit at the root.
                 let clean_name = current_filename.trim_start_matches('/');
                 VFS_ROOT.add(clean_name, vnode);
             }
 
-            // Saltar al siguiente bloque
-            let data_blocks = (file_size + 511) / 512; 
+            // Advance to the next entry.
+            let data_blocks = (file_size + 511) / 512;
             offset += 512 + (data_blocks * 512);
         }
     }

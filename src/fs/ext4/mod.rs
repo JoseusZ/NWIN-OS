@@ -12,6 +12,7 @@ pub mod block_group;
 pub mod dir_entry;
 
 use alloc::sync::Arc;
+use crate::core::error::FsError;
 use crate::fs::vfs::VNode;
 use crate::fs::ext4::volume::Ext4Volume;
 use crate::fs::ext4::inode::Ext4Inode;
@@ -50,20 +51,33 @@ impl Ext4Node {
     }
 
 
-    /// Añade una nueva entrada a este directorio encogiendo el padding de la última entrada
-    pub fn add_entry(&self, name: &str, inode_num: u32) -> Result<(), &'static str> {
-        if !self.is_directory { return Err("El nodo no es un directorio"); }
+    /// Añade una nueva entrada a este directorio encogiendo el padding
+    /// de la última entrada.
+    ///
+    /// **Fase 3.3:** Migrado a `Result<(), FsError>`. Reglas de mapeo:
+    /// - `!is_directory` → `FsError::CorruptedDirectory` (invariante
+    ///   estructural del VNode).
+    /// - `logical_to_physical_sector` falla → `FsError::CorruptedDirectory`
+    ///   (inodo con extents corruptos o vacios para un directorio).
+    /// - `read_block` / `write_block` → `FsError::BlockRead` /
+    ///   `FsError::BlockWrite`.
+    /// - Sin espacio de padding → `FsError::NoSpace`.
+    /// - `rec_len == 0` o desbordamiento → `FsError::CorruptedDirectory`.
+    pub fn add_entry(&self, name: &str, inode_num: u32) -> Result<(), FsError> {
+        if !self.is_directory { return Err(FsError::CorruptedDirectory); }
 
         let block_size = self.volume.super_block.block_size() as usize;
         let mut buffer = alloc::vec![0u8; block_size];
 
-        // 1. Ubicamos el sector físico del bloque del directorio (Bloque lógico 0 del Inodo 2)
+        // 1. Ubicamos el sector fisico del bloque del directorio (Bloque logico 0 del Inodo 2)
         let physical_sector = self.volume.logical_to_physical_sector(&self.inode, 0)
-            .ok_or("Fallo al traducir bloque de directorio")?;
+            .ok_or(FsError::CorruptedDirectory)?;
 
         // 2. Leemos el bloque completo (4096 bytes = 8 sectores)
         for i in 0..(block_size / 512) {
-            self.volume.device.read_block(physical_sector + i as u64, &mut buffer[i * 512 .. (i + 1) * 512])?;
+            self.volume.device
+                .read_block(physical_sector + i as u64, &mut buffer[i * 512 .. (i + 1) * 512])
+                .map_err(|_| FsError::BlockRead)?;
         }
 
         // 3. Recorremos los registros hasta encontrar el último (el que tiene el padding sobrante)
@@ -85,7 +99,7 @@ impl Ext4Node {
                 let new_entry_aligned = (new_entry_real + 3) & !3;
 
                 if space_left < new_entry_aligned {
-                    return Err("Directorio lleno, no hay espacio para el padding");
+                    return Err(FsError::NoSpace);
                 }
 
                 // A. Encogemos la entrada actual modificando su rec_len en la memoria RAM
@@ -116,12 +130,14 @@ impl Ext4Node {
             }
 
             offset += rec_len;
-            if offset >= block_size || rec_len == 0 { return Err("Corrupción en directorio"); }
+            if offset >= block_size || rec_len == 0 { return Err(FsError::CorruptedDirectory); }
         }
 
         // 4. Quemamos el directorio actualizado en el disco
         for i in 0..(block_size / 512) {
-            self.volume.device.write_block(physical_sector + i as u64, &buffer[i * 512 .. (i + 1) * 512])?;
+            self.volume.device
+                .write_block(physical_sector + i as u64, &buffer[i * 512 .. (i + 1) * 512])
+                .map_err(|_| FsError::BlockWrite)?;
         }
 
         Ok(())

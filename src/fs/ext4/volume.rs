@@ -6,6 +6,7 @@
 
 use alloc::sync::Arc;
 use crate::fs::BlockDevice;
+use crate::core::error::FsError;
 use super::super_block::Ext4SuperBlock;
 use crate::fs::ext4::inode::Ext4Inode;
 use crate::fs::ext4::extents::{Ext4ExtentHeader, Ext4Extent};
@@ -19,17 +20,33 @@ pub struct Ext4Volume {
 
 impl Ext4Volume {
     /// Lee el Superbloque y valida que sea un sistema Ext4
-    pub fn mount(device: Arc<dyn BlockDevice>, start_lba: u64) -> Result<Self, &'static str> {
+    ///
+    /// **Fase 3.3:** El retorno migra de `Result<Self, &'static str>` a
+    /// `Result<Self, FsError>`. La firma magica del superbloque Ext4
+    /// (`0xEF53` little-endian en `s_magic`) se valida devolviendo
+    /// `FsError::BadMagic { expected: 0xEF53, found }` para mantener
+    /// paridad con las Fases 3.1 (MBR) y 3.2 (FAT). Los call sites
+    /// (`manager.rs`, `ext4/mod.rs`) siguen compilando sin cambios
+    /// porque `FsError` implementa `Display` desde la Fase 1.7.
+    pub fn mount(device: Arc<dyn BlockDevice>, start_lba: u64) -> Result<Self, FsError> {
         let mut buffer = [0u8; 1024]; // Leemos un poco más para asegurar el superbloque
-        
-        
+
+
         // El superbloque de ext4 comienza en el offset 1024 (Byte 1024) respecto al inicio de la partición.
         // Si el LBA inicia en `start_lba`, el superbloque está en `start_lba + 2` (asumiendo sectores de 512 bytes).
         let super_block_sector = start_lba + 2;
-        
-        device.read_block(super_block_sector, &mut buffer[0..512])?;
+
+        // Lectura cruda: misma convencion que MBR/FAT. La capa de
+        // drivers (`BlockDevice::read_block`) aun devuelve
+        // `&'static str`; mapeamos a `FsError::BlockRead` para no
+        // filtrar tipos primitivos fuera del modulo.
+        device
+            .read_block(super_block_sector, &mut buffer[0..512])
+            .map_err(|_| FsError::BlockRead)?;
         // A veces el superbloque puede cruzar fronteras, leemos un segundo sector por seguridad
-        device.read_block(super_block_sector + 1, &mut buffer[512..1024])?;
+        device
+            .read_block(super_block_sector + 1, &mut buffer[512..1024])
+            .map_err(|_| FsError::BlockRead)?;
 
         let mut super_block: Ext4SuperBlock = unsafe { core::mem::zeroed() };
         unsafe {
@@ -41,9 +58,16 @@ impl Ext4Volume {
             );
         }
 
-        // Validación de la firma mágica
+        // Validacion de la firma magica del superbloque Ext4.
+        // La palabra magica vive en formato little-endian en disco,
+        // por lo que `s_magic` (u16 LE) tiene el valor nativo 0xEF53
+        // cuando se lee correctamente. Conservamos el valor crudo
+        // encontrado para diagnostico.
         if super_block.s_magic != 0xEF53 {
-            return Err("Firma Ext4 invalida (No se encontro 0xEF53)");
+            return Err(FsError::BadMagic {
+                expected: 0xEF53,
+                found: { super_block.s_magic },
+            });
         }
 
         Ok(Ext4Volume {
@@ -64,7 +88,13 @@ impl Ext4Volume {
         }
     }
 
-    pub fn allocate_inode(&self) -> Result<u32, &'static str> {
+    /// Reserva el primer inodo libre del Block Group 0.
+    ///
+    /// **Fase 3.3:** Migrado a `Result<u32, FsError>`. La propagacion
+    /// del error de `BlockDevice::read_block`/`write_block` se mapea
+    /// a `FsError::BlockRead`/`BlockWrite`. El agotamiento del bitmap
+    /// de inodos se traduce a `FsError::OutOfInodes`.
+    pub fn allocate_inode(&self) -> Result<u32, FsError> {
         let block_size = self.super_block.block_size();
 
         // Para nuestro MVP, buscaremos espacio libre en el Grupo de Bloques 0
@@ -75,11 +105,13 @@ impl Ext4Volume {
         let bgd_sector_start = self.start_lba + (bgd_block_logic * (block_size / 512));
 
         let mut bgd_buffer = [0u8; 512];
-        self.device.read_block(bgd_sector_start, &mut bgd_buffer)?;
+        self.device
+            .read_block(bgd_sector_start, &mut bgd_buffer)
+            .map_err(|_| FsError::BlockRead)?;
 
         let bgd_offset = (group_index as usize * core::mem::size_of::<crate::fs::ext4::block_group::Ext4BlockGroupDescriptor>()) % 512;
         let mut bgd: crate::fs::ext4::block_group::Ext4BlockGroupDescriptor = unsafe { core::mem::zeroed() };
-        
+
         unsafe {
             core::ptr::copy_nonoverlapping(
                 bgd_buffer.as_ptr().add(bgd_offset),
@@ -94,7 +126,9 @@ impl Ext4Volume {
 
         // Leemos el primer sector del bitmap (512 bytes = controlan 4096 inodos, suficiente para probar)
         let mut bitmap_buffer = [0u8; 512];
-        self.device.read_block(bitmap_sector, &mut bitmap_buffer)?;
+        self.device
+            .read_block(bitmap_sector, &mut bitmap_buffer)
+            .map_err(|_| FsError::BlockRead)?;
 
         // 3. Escanear los bytes buscando un bit que sea '0'
         for (byte_index, byte) in bitmap_buffer.iter_mut().enumerate() {
@@ -102,12 +136,14 @@ impl Ext4Volume {
                 for bit_index in 0..8 {
                     if (*byte & (1 << bit_index)) == 0 {
                         // ¡ENCONTRAMOS UN INODO LIBRE!
-                        
+
                         // 4. Lo marcamos como Ocupado (Cambiamos el 0 a 1 usando un OR bit a bit)
                         *byte |= 1 << bit_index;
 
                         // 5. ¡DISPARAMOS DMA DE ESCRITURA! Guardamos el bitmap actualizado en el disco
-                        self.device.write_block(bitmap_sector, &bitmap_buffer)?;
+                        self.device
+                            .write_block(bitmap_sector, &bitmap_buffer)
+                            .map_err(|_| FsError::BlockWrite)?;
 
                         // 6. Calculamos el número de Inodo real (Base 1 en Ext4)
                         let inode_num = (byte_index * 8 + bit_index + 1) as u32;
@@ -119,11 +155,16 @@ impl Ext4Volume {
             }
         }
 
-        Err("No hay inodos libres en el grupo de bloques actual")
+        Err(FsError::OutOfInodes)
     }
 
-    /// Busca un bloque de datos físico libre, lo marca como ocupado y guarda el cambio en el disco.
-    pub fn allocate_block(&self) -> Result<u32, &'static str> {
+    /// Busca un bloque de datos físico libre, lo marca como ocupado
+    /// y guarda el cambio en el disco.
+    ///
+    /// **Fase 3.3:** Migrado a `Result<u32, FsError>`. Mismas
+    /// reglas de mapeo que `allocate_inode`: `read_block` → `BlockRead`,
+    /// `write_block` → `BlockWrite`, agotamiento → `OutOfBlocks`.
+    pub fn allocate_block(&self) -> Result<u32, FsError> {
         let block_size = self.super_block.block_size();
         let group_index = 0; // Para el MVP seguimos operando en el Grupo 0
 
@@ -132,11 +173,13 @@ impl Ext4Volume {
         let bgd_sector_start = self.start_lba + (bgd_block_logic * (block_size / 512));
 
         let mut bgd_buffer = [0u8; 512];
-        self.device.read_block(bgd_sector_start, &mut bgd_buffer)?;
+        self.device
+            .read_block(bgd_sector_start, &mut bgd_buffer)
+            .map_err(|_| FsError::BlockRead)?;
 
         let bgd_offset = (group_index as usize * core::mem::size_of::<crate::fs::ext4::block_group::Ext4BlockGroupDescriptor>()) % 512;
         let mut bgd: crate::fs::ext4::block_group::Ext4BlockGroupDescriptor = unsafe { core::mem::zeroed() };
-        
+
         unsafe {
             core::ptr::copy_nonoverlapping(
                 bgd_buffer.as_ptr().add(bgd_offset),
@@ -151,7 +194,9 @@ impl Ext4Volume {
 
         // Leemos el sector DMA
         let mut bitmap_buffer = [0u8; 512];
-        self.device.read_block(bitmap_sector, &mut bitmap_buffer)?;
+        self.device
+            .read_block(bitmap_sector, &mut bitmap_buffer)
+            .map_err(|_| FsError::BlockRead)?;
 
         // 3. Escanear buscando un bloque de 4096 bytes libre (bit == 0)
         for (byte_index, byte) in bitmap_buffer.iter_mut().enumerate() {
@@ -164,7 +209,9 @@ impl Ext4Volume {
                         *byte |= 1 << bit_index;
 
                         // 5. ¡DISPARAMOS DMA! Quemamos el mapa actualizado en el disco magnético
-                        self.device.write_block(bitmap_sector, &bitmap_buffer)?;
+                        self.device
+                            .write_block(bitmap_sector, &bitmap_buffer)
+                            .map_err(|_| FsError::BlockWrite)?;
 
                         // 6. El índice del bit representa el número lógico de bloque dentro del grupo
                         // En Ext4 moderno (con bloques de 4K), el bit 0 corresponde al bloque lógico 0.
@@ -177,14 +224,20 @@ impl Ext4Volume {
             }
         }
 
-        Err("No hay bloques libres en el grupo actual")
+        Err(FsError::OutOfBlocks)
     }
 
-    /// Lee un Inodo específico directamente desde el disco usando AHCI (DMA)
-    /// Lee un Inodo específico directamente desde el disco usando AHCI (DMA)
-    pub fn read_inode(&self, inode_num: u32) -> Result<Ext4Inode, &'static str> {
+    /// Lee un Inodo específico directamente desde el disco usando AHCI (DMA).
+    ///
+    /// **Fase 3.3:** Migrado a `Result<Ext4Inode, FsError>`. La
+    /// validacion de rango del inodo se traduce a
+    /// `FsError::CorruptedDirectory` (un inodo fuera de los limites
+    /// es una incoherencia estructural del FS, no un bitmap agotado).
+    /// Las dos `read_block` del BGD y del inodo se canalizan a
+    /// `FsError::BlockRead`.
+    pub fn read_inode(&self, inode_num: u32) -> Result<Ext4Inode, FsError> {
         if inode_num < 1 || inode_num > self.super_block.s_inodes_count {
-            return Err("Número de Inodo fuera de los límites del disco.");
+            return Err(FsError::CorruptedDirectory);
         }
 
         let block_size = self.super_block.block_size();
@@ -198,13 +251,15 @@ impl Ext4Volume {
         // 2. Leer la Tabla de Descriptores de Grupo (BGD)
         let bgd_block_logic = self.bgd_block();
         let bgd_sector_start = self.start_lba + (bgd_block_logic * (block_size / 512));
-        
+
         let mut bgd_buffer = [0u8; 512];
-        self.device.read_block(bgd_sector_start, &mut bgd_buffer)?;
+        self.device
+            .read_block(bgd_sector_start, &mut bgd_buffer)
+            .map_err(|_| FsError::BlockRead)?;
 
         let bgd_offset = (group_index as usize * core::mem::size_of::<crate::fs::ext4::block_group::Ext4BlockGroupDescriptor>()) % 512;
         let mut bgd: crate::fs::ext4::block_group::Ext4BlockGroupDescriptor = unsafe { core::mem::zeroed() };
-        
+
         unsafe {
             core::ptr::copy_nonoverlapping(
                 bgd_buffer.as_ptr().add(bgd_offset),
@@ -216,16 +271,18 @@ impl Ext4Volume {
         // 3. Localizar la Tabla de Inodos físicamente en el disco (Matemática Absoluta Corregida)
         let inode_table_block = { bgd.bg_inode_table_lo } as u64;
         let byte_offset_in_table = (inode_index_in_group as u64) * inode_size;
-        
+
         let absolute_byte_offset = (inode_table_block * block_size) + byte_offset_in_table;
-        
+
         // ¡Aquí es donde usamos las variables del warning!
         let target_sector = self.start_lba + (absolute_byte_offset / 512);
         let offset_in_sector = (absolute_byte_offset % 512) as usize;
 
         // 4. Disparar DMA y trasladar a memoria (Aquí se consume target_sector)
         let mut inode_buffer = [0u8; 512];
-        self.device.read_block(target_sector, &mut inode_buffer)?;
+        self.device
+            .read_block(target_sector, &mut inode_buffer)
+            .map_err(|_| FsError::BlockRead)?;
 
         let mut inode: Ext4Inode = unsafe { core::mem::zeroed() };
         unsafe {
@@ -238,14 +295,21 @@ impl Ext4Volume {
         }
 
         Ok(inode)
-        
+
     }
 
-    pub fn write_data_to_block(&self, block_num: u32, data: &[u8]) -> Result<(), &'static str> {
+    /// Escribe los datos de un archivo en un bloque físico reservado.
+    ///
+    /// **Fase 3.3:** Migrado a `Result<(), FsError>`. El desbordamiento
+    /// del buffer mas alla del tamaño de bloque se traduce a
+    /// `FsError::CorruptedDirectory` (tamanno incoherente con la
+    /// geometria del FS); las escrituras del DMA, a
+    /// `FsError::BlockWrite`.
+    pub fn write_data_to_block(&self, block_num: u32, data: &[u8]) -> Result<(), FsError> {
         let block_size = self.super_block.block_size() as usize;
 
         if data.len() > block_size {
-            return Err("El buffer de datos excede el tamaño de un bloque Ext4");
+            return Err(FsError::CorruptedDirectory);
         }
 
         // 1. Calculamos el sector físico inicial (Base LBA + offset del bloque)
@@ -266,7 +330,9 @@ impl Ext4Volume {
             let sector_slice = &block_buffer[offset .. offset + 512];
             
             // ¡Disparamos el DMA al láser del disco!
-            self.device.write_block(sector_lba, sector_slice)?;
+            self.device
+                .write_block(sector_lba, sector_slice)
+                .map_err(|_| FsError::BlockWrite)?;
         }
 
         crate::serial_println!("[EXT4] Datos quemados con éxito en el Bloque Físico {}", block_num);
@@ -387,16 +453,20 @@ impl Ext4Volume {
 
         inode
     }
-
-
-    pub fn write_inode(&self, inode_num: u32, inode: &Ext4Inode) -> Result<(), &'static str> {
+/// Escribe un Inodo (`read-modify-write`) preservando el resto
+    /// del sector de 512 bytes que lo contiene.
+    ///
+    /// **Fase 3.3:** Migrado a `Result<(), FsError>`. Mismas reglas
+    /// que `read_inode`: rango invalido → `CorruptedDirectory`,
+    /// `read_block` → `BlockRead`, `write_block` → `BlockWrite`.
+    pub fn write_inode(&self, inode_num: u32, inode: &Ext4Inode) -> Result<(), FsError> {
         if inode_num < 1 || inode_num > self.super_block.s_inodes_count {
-            return Err("Número de Inodo fuera de los límites del disco.");
+            return Err(FsError::CorruptedDirectory);
         }
 
         let block_size = self.super_block.block_size();
         let inodes_per_group = self.super_block.s_inodes_per_group;
-        let inode_size = 256; 
+        let inode_size = 256;
 
         // 1. Matemáticas para ubicar el inodo
         let group_index = (inode_num - 1) / inodes_per_group;
@@ -405,9 +475,11 @@ impl Ext4Volume {
         // 2. Leer la Tabla de Descriptores de Grupo (BGD)
         let bgd_block_logic = self.bgd_block();
         let bgd_sector_start = self.start_lba + (bgd_block_logic * (block_size / 512));
-        
+
         let mut bgd_buffer = [0u8; 512];
-        self.device.read_block(bgd_sector_start, &mut bgd_buffer)?;
+        self.device
+            .read_block(bgd_sector_start, &mut bgd_buffer)
+            .map_err(|_| FsError::BlockRead)?;
 
         let bgd_offset = (group_index as usize * core::mem::size_of::<crate::fs::ext4::block_group::Ext4BlockGroupDescriptor>()) % 512;
         let mut bgd: crate::fs::ext4::block_group::Ext4BlockGroupDescriptor = unsafe { core::mem::zeroed() };
@@ -423,13 +495,15 @@ impl Ext4Volume {
         let inode_table_block = { bgd.bg_inode_table_lo } as u64;
         let byte_offset_in_table = (inode_index_in_group as u64) * inode_size;
         let absolute_byte_offset = (inode_table_block * block_size) + byte_offset_in_table;
-        
+
         let target_sector = self.start_lba + (absolute_byte_offset / 512);
         let offset_in_sector = (absolute_byte_offset % 512) as usize;
 
         // 4. READ-MODIFY-WRITE (Traer sector, modificar memoria, quemar sector)
         let mut sector_buffer = [0u8; 512];
-        self.device.read_block(target_sector, &mut sector_buffer)?;
+        self.device
+            .read_block(target_sector, &mut sector_buffer)
+            .map_err(|_| FsError::BlockRead)?;
 
         unsafe {
             core::ptr::copy_nonoverlapping(
@@ -439,7 +513,9 @@ impl Ext4Volume {
             );
         }
 
-        self.device.write_block(target_sector, &sector_buffer)?;
+        self.device
+            .write_block(target_sector, &sector_buffer)
+            .map_err(|_| FsError::BlockWrite)?;
 
         crate::serial_println!("[EXT4] Metadatos actualizados en disco para Inodo {}", inode_num);
         Ok(())
