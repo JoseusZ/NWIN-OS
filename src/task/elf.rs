@@ -1,7 +1,7 @@
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PhysFrame;
 
-#[derive(Debug, Clone)] // <--- Asegúrate de que tenga esto
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ElfError {
     TooSmall,
     InvalidMagicNumber,
