@@ -7,3 +7,7 @@
 /tests/disk-images/*.img
 # Backups accidentales del editor
 *.rs.bk
+# Excepción: no ignorar el README principal
+!README.md
+# Ignorar todos los archivos Markdown
+*.md
