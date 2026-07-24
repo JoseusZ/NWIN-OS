@@ -2,13 +2,24 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/drivers/pci.rs
+//! PCI bus enumeration.
+//!
+//! Walks the configuration space of every (bus, device, function)
+//! triple reachable through the legacy I/O-port based mechanism
+//! (`0xCF8` / `0xCFC`) and decodes the most common device classes
+//! used by the kernel (AHCI SATA, IDE, Ethernet, VGA, host bridges
+//! and ISA bridges).
+
 use x86_64::instructions::port::Port;
 use alloc::vec::Vec;
 
+// I/O ports of the legacy PCI configuration access mechanism
+// (CAM): writing `(bus, device, fn, offset) | 0x80000000` to the
+// address port selects a 32-bit word that the data port then serves.
 const PCI_CONFIG_ADDRESS_PORT: u16 = 0xCF8;
 const PCI_CONFIG_DATA_PORT: u16 = 0xCFC;
 
+/// PCI vendor identifier.
 #[derive(Debug, PartialEq)]
 pub enum Vendor {
     Intel,
@@ -19,6 +30,7 @@ pub enum Vendor {
 }
 
 impl Vendor {
+    /// Decodes a raw 16-bit vendor ID into the closest known vendor.
     pub fn new(id: u32) -> Self {
         match id {
             0x8086 => Self::Intel,
@@ -29,6 +41,8 @@ impl Vendor {
         }
     }
 
+    /// Returns whether a slot actually holds a device. PCI uses
+    /// `0xFFFF` as the "no device" sentinel for the vendor ID.
     pub fn is_valid(&self) -> bool {
         match self {
             Self::Unknown(id) => *id != 0xFFFF,
@@ -37,6 +51,8 @@ impl Vendor {
     }
 }
 
+/// PCI device class decoded from the (base class, sub class) pair
+/// of the configuration space.
 #[derive(Debug, PartialEq)]
 pub enum DeviceType {
     SataController,
@@ -49,6 +65,8 @@ pub enum DeviceType {
 }
 
 impl DeviceType {
+    /// Decodes a (base class, sub class) pair into the closest known
+    /// device type.
     pub fn new(base_class: u32, sub_class: u32) -> Self {
         match (base_class, sub_class) {
             (0x01, 0x01) => DeviceType::IdeController,
@@ -62,6 +80,7 @@ impl DeviceType {
     }
 }
 
+/// One PCI function discovered on the bus.
 pub struct PciDevice {
     pub bus: u8,
     pub device: u8,
@@ -72,6 +91,8 @@ pub struct PciDevice {
 
 impl PciDevice {
 
+    /// Writes a 32-bit value to the PCI configuration space at the
+    /// given (bus, device, function, offset).
     pub unsafe fn write_u32(bus: u8, device: u8, func: u8, offset: u8, value: u32) {
         let address = (bus as u32) << 16
             | (device as u32) << 11
@@ -87,6 +108,8 @@ impl PciDevice {
     }
 
 
+    /// Enables Memory-Mapped I/O in the device's command register
+    /// (bit 1 of offset `0x04`).
     pub fn enable_mmio(&self) {
         unsafe {
             let command = Self::read_u32(self.bus, self.device, self.function, 0x04);
@@ -94,6 +117,8 @@ impl PciDevice {
         }
     }
 
+    /// Enables bus mastering in the device's command register
+    /// (bit 2 of offset `0x04`), required for DMA.
     pub fn enable_bus_mastering(&self) {
         unsafe {
             let command = Self::read_u32(self.bus, self.device, self.function, 0x04);
@@ -101,12 +126,16 @@ impl PciDevice {
         }
     }
 
+    /// Returns BAR5 (Base Address Register 5) with the low 4 bits
+    /// (type/indicator flags) masked out, leaving only the address.
     pub fn get_bar5(&self) -> u32 {
         let bar_value = unsafe { Self::read_u32(self.bus, self.device, self.function, 0x24) };
-        // Limpiamos los 4 bits más bajos, ya que son banderas de información, no parte de la dirección.
-        bar_value & 0xFFFFFFF0 
+        // Mask off the low 4 bits: they are information flags, not part of the address.
+        bar_value & 0xFFFFFFF0
     }
 
+    /// Reads a 32-bit value from the PCI configuration space at the
+    /// given (bus, device, function, offset).
     pub unsafe fn read_u32(bus: u8, device: u8, func: u8, offset: u8) -> u32 {
         let address = (bus as u32) << 16
             | (device as u32) << 11
@@ -121,9 +150,12 @@ impl PciDevice {
         data_port.read()
     }
 
+    /// Probes the (bus, device, function) triple and returns
+    /// `Some(PciDevice)` if a real device is present, or `None`
+    /// when the slot is empty.
     pub fn new(bus: u8, device: u8, function: u8) -> Option<Self> {
         unsafe {
-            // Offset 0x00 contiene el Vendor ID (primeros 16 bits)
+            // Offset 0x00 holds the Vendor ID in the low 16 bits.
             let vendor_id = Self::read_u32(bus, device, function, 0x00) & 0xFFFF;
             let vendor = Vendor::new(vendor_id);
 
@@ -131,7 +163,7 @@ impl PciDevice {
                 return None;
             }
 
-            // Offset 0x08 contiene el Class Code y Subclass Code en los bits altos
+            // Offset 0x08 holds the Class Code and Subclass Code in the high bits.
             let class_info = Self::read_u32(bus, device, function, 0x08);
             let base_class = (class_info >> 24) & 0xFF;
             let sub_class = (class_info >> 16) & 0xFF;
@@ -147,6 +179,8 @@ impl PciDevice {
         }
     }
 
+    /// Returns whether the given (bus, device) exposes more than one
+    /// function, derived from bit 7 of the header type register.
     pub fn has_multiple_functions(bus: u8, device: u8) -> bool {
         unsafe {
             let header_type = (Self::read_u32(bus, device, 0, 0x0C) >> 16) & 0xFF;
@@ -155,25 +189,26 @@ impl PciDevice {
     }
 }
 
-/// Escanea el bus PCI utilizando el método de fuerza bruta (Buses 0-255, Dispositivos 0-31)
+/// Scans the PCI bus using the brute-force method (buses 0-255,
+/// devices 0-31) and returns every device that responds.
 pub fn scan_pci_bus() -> Vec<PciDevice> {
     let mut devices = Vec::new();
 
-    crate::println!("[PCI] Escaneando hardware...");
+    crate::println!("[PCI] Scanning hardware...");
 
     for bus in 0..=255 {
         for device in 0..32 {
-            // Verificamos si existe la función 0. Si no existe, no hay dispositivo.
+            // Probe function 0 first; if it is absent there is no device in this slot.
             if PciDevice::new(bus, device, 0).is_some() {
-                
+
                 let multiple_functions = PciDevice::has_multiple_functions(bus, device);
                 let functions_to_check = if multiple_functions { 8 } else { 1 };
 
                 for function in 0..functions_to_check {
                     if let Some(func_dev) = PciDevice::new(bus, device, function) {
                         crate::println!(
-                            "  --> Detectado: [{:?}] {:?}", 
-                            func_dev.vendor, 
+                            "  --> Detected: [{:?}] {:?}",
+                            func_dev.vendor,
                             func_dev.device_type
                         );
                         devices.push(func_dev);
@@ -182,17 +217,17 @@ pub fn scan_pci_bus() -> Vec<PciDevice> {
             }
         }
     }
-    
-    crate::println!("[PCI] Escaneo completado. {} dispositivos encontrados.", devices.len());
+
+    crate::println!("[PCI] Scan complete. {} devices found.", devices.len());
     devices
 }
 
 // ====================================================================
-// INICIALIZACIÓN DEL SUBSISTEMA PCI
+// PCI SUBSYSTEM INITIALISATION
 // ====================================================================
 
-/// Inicializa el bus PCI, escanea los dispositivos y devuelve la 
-/// dirección de memoria (BAR5) de la controladora SATA si existe.
+/// Initialises the PCI bus, scans for devices and returns the
+/// memory address (BAR5) of the SATA controller if one is found.
 pub fn init() -> Option<u32> {
     let pci_devices = scan_pci_bus();
     let mut ahci_base_address: Option<u32> = None;
@@ -201,21 +236,21 @@ pub fn init() -> Option<u32> {
         if dev.device_type == DeviceType::SataController {
             let bar5 = dev.get_bar5();
             ahci_base_address = Some(bar5);
-            
+
             dev.enable_mmio();
             dev.enable_bus_mastering();
-            
-            crate::serial_println!("[SATA] Controladora detectada en Bus {}, Dispositivo {}", dev.bus, dev.device);
-            crate::serial_println!("[SATA] Registros AHCI mapeados en memoria fisica: {:#010x}", bar5);
-            crate::serial_println!("[SATA] MMIO y Bus Mastering HABILITADOS.");
+
+            crate::serial_println!("[SATA] Controller detected on Bus {}, Device {}", dev.bus, dev.device);
+            crate::serial_println!("[SATA] AHCI registers mapped at physical address: {:#010x}", bar5);
+            crate::serial_println!("[SATA] MMIO and Bus Mastering ENABLED.");
             crate::drivers::block::ahci::init(bar5);
-            
-            break; 
+
+            break;
         }
     }
 
     if ahci_base_address.is_none() {
-        crate::serial_println!("[WARNING] No se encontro ninguna controladora SATA en el bus PCI.");
+        crate::serial_println!("[WARNING] No SATA controller was found on the PCI bus.");
     }
 
     ahci_base_address

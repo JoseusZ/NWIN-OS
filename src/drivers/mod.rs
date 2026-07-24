@@ -2,6 +2,18 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Device drivers and hardware adapters.
+//!
+//! - [`block`]: block-device drivers (currently AHCI for SATA disks).
+//! - [`bus`]: system buses (PCI enumeration).
+//! - [`char`]: character devices (16550A-compatible serial UART).
+//! - [`display`]: framebuffer and TTY output.
+//! - [`input`]: input devices (PS/2 keyboard).
+//! - [`timer`]: programmable interval timer (PIT).
+//!
+//! The most commonly consumed pieces are re-exported at the crate
+//! root: [`pci`] (bus scan) and [`serial`] (kernel log sink).
+
 pub mod block;
 pub mod bus;
 pub mod char;

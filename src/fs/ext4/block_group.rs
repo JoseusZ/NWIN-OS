@@ -2,14 +2,18 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/fs/ext4/block_group.rs
+//! ext4 block-group descriptor structures.
 
+/// On-disk ext4 block-group descriptor (32 bytes for 32-bit
+/// revisions), packed to match the layout that follows the
+/// super-block.
 #[derive(Debug, Clone, Copy)]
 #[repr(packed)]
 pub struct Ext4BlockGroupDescriptor {
     pub bg_block_bitmap_lo: u32,
     pub bg_inode_bitmap_lo: u32,
-    pub bg_inode_table_lo: u32,      // ¡ESTE ES EL DATO VITAL! Dónde empiezan los inodos
+    /// Starting block of the inode table for this group.
+    pub bg_inode_table_lo: u32,
     pub bg_free_blocks_count_lo: u16,
     pub bg_free_inodes_count_lo: u16,
     pub bg_used_dirs_count_lo: u16,

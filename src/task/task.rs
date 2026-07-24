@@ -5,29 +5,56 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 use crate::fs::fd::FdTable;
 
-/// Identificador único y absoluto para cada tarea del sistema
+/// Per-task data model: identifier, saved-register snapshot, kernel
+/// stack, page table, file-descriptor table and the privilege level
+/// at which the task is entered.
+pub struct Task {
+    // Task identity
+    pub id:          TaskId,
+    pub parent_id:   Option<TaskId>,
+    // Saved top of the kernel stack (context_switch reads/writes it)
+    pub rsp:         u64,
+    // Physical frame that holds the task's PML4
+    pub pml4_frame:  x86_64::structures::paging::PhysFrame,
+    // Backing memory of the kernel stack
+    pub stack_start: u64,
+    pub stack_end:   u64,
+    _stack:          alloc::boxed::Box<[u8]>,
+    // Ring 0 vs Ring 3
+    pub privilege:   PrivilegeLevel,
+    // User-space memory layout
+    pub heap_start:    u64,
+    pub program_break: u64,
+    pub mmap_base:     u64,
+    // Per-task file descriptor table
+    pub fd_table: FdTable,
+}
+
+/// Process-wide unique identifier for a task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TaskId(pub u64);
 
 impl TaskId {
+    /// Allocates the next available id from a process-wide atomic counter.
     pub fn new() -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         TaskId(NEXT_ID.fetch_add(1, Ordering::Relaxed))
     }
 }
 
-// --- Distinción de Privilegio ---
-/// Define el nivel de privilegio en el que se ejecutará una tarea.
+/// Privilege level at which a task is entered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrivilegeLevel {
-    /// Hilo del núcleo. Tiene acceso total a memoria y hardware (Ring 0).
+    /// Kernel thread. Full access to memory and hardware (Ring 0).
     KernelMode,
-    /// Proceso de usuario. El scheduler lo iniciará en Ring 3 mediante iretq.
+    /// User process. The scheduler enters it in Ring 3 via `iretq`.
     UserMode,
 }
 
-/// Registros callee-saved según la ABI SysV x86_64.
-/// ORDEN CRÍTICO: debe coincidir exactamente con el push/pop del asm de context_switch.
+/// Caller-saved register snapshot defined by the SysV x86_64 ABI.
+///
+/// **Field order is critical**: it must match exactly the push/pop
+/// sequence in [`context_switch`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct TaskContext {
@@ -40,40 +67,38 @@ pub struct TaskContext {
     pub r15:    u64, // RSP+48
 }
 
-pub struct Task {
-    pub id:          TaskId,
-    pub parent_id:   Option<TaskId>,
-    pub rsp:         u64,
-    pub pml4_frame:  x86_64::structures::paging::PhysFrame,
-    pub stack_start: u64,
-    pub stack_end:   u64,
-    _stack:          alloc::boxed::Box<[u8]>,
-    pub privilege:   PrivilegeLevel,
-    pub heap_start:    u64, 
-    pub program_break: u64,
-    pub mmap_base:     u64, 
-    pub fd_table: FdTable,
-}
-
 impl Task {
+    /// Builds a new [`Task`] with a freshly allocated 64 KiB kernel
+    /// stack and a hand-crafted initial stack frame that matches the
+    /// target [`PrivilegeLevel`].
+    ///
+    /// For [`PrivilegeLevel::UserMode`] the frame is laid out so that
+    /// an `iretq` jumps into user space with the kernel's chosen SS,
+    /// RSP, RFLAGS, CS and RIP. For [`PrivilegeLevel::KernelMode`] a
+    /// `0xDEAD_C0DE_DEAD_C0DE` canary is pushed below the entry point
+    /// to catch stack underflow during development.
+    ///
+    /// Returns [`KernelError::Task`] wrapping
+    /// [`TaskError::StackAllocation`] if the heap cannot satisfy the
+    /// stack reservation.
     pub fn new(
         entry_point: fn() -> !,
         pml4_frame: x86_64::structures::paging::PhysFrame,
         privilege: PrivilegeLevel,
         user_stack_top: u64,
-        parent_id: Option<TaskId>, // <-- NUEVO ARGUMENTO
-    ) -> Result<Self, crate::core::error::KernelError> { 
-        
+        parent_id: Option<TaskId>,
+    ) -> Result<Self, crate::core::error::KernelError> {
+
         const STACK_SIZE: usize = 65536; // 64 KiB
         let id = TaskId::new();
         let mut stack_vec = alloc::vec::Vec::new();
 
-        // 2. Erradicamos el bucle de muerte. Devolvemos el error estructurado.
+        // Eradicate the death loop: return a structured error instead.
         //
-        // Fase 7: usamos `TaskError::StackAllocation` (declarado en Fase 1.6)
-        // en lugar del legacy bridge `SystemError::TaskCreationFailure`. La
-        // conversion `From<TaskError> for KernelError` (Fase 2.1) se activa
-        // automaticamente al envolver.
+        // Phase 7: use `TaskError::StackAllocation` (declared in Phase 1.6)
+        // instead of the legacy bridge `SystemError::TaskCreationFailure`.
+        // The `From<TaskError> for KernelError` conversion (Phase 2.1) is
+        // triggered automatically when wrapping.
         if stack_vec.try_reserve_exact(STACK_SIZE).is_err() {
             return Err(crate::core::error::KernelError::Task(
                 crate::core::error::TaskError::StackAllocation
@@ -82,14 +107,10 @@ impl Task {
 
         stack_vec.resize(STACK_SIZE, 0);
 
-        // 1. Extraemos los datos crudos del vector
+        // Hand the buffer to a Box without going through Vec::drop.
         let ptr = stack_vec.as_mut_ptr();
         let len = stack_vec.len();
-
-        // 2. Le quitamos el control al vector para que Rust no llame a 'drop'
         core::mem::forget(stack_vec);
-
-        // 3. Construimos el Box directamente desde el puntero crudo
         let slice_ptr = core::ptr::slice_from_raw_parts_mut(ptr, len);
         let stack = unsafe { alloc::boxed::Box::from_raw(slice_ptr) };
 
@@ -99,19 +120,19 @@ impl Task {
 
         unsafe {
             if privilege == PrivilegeLevel::UserMode {
-                
-                // *** VITAL: El '| 3' fuerza físicamente a la CPU a bajar a Ring 3 ***
+
+                // **VITAL**: the `| 3` physically forces the CPU to drop to Ring 3.
                 let user_data_selector = (crate::core::gdt::GDT.1.user_data_selector.0 as u64) | 3;
                 let user_code_selector = (crate::core::gdt::GDT.1.user_code_selector.0 as u64) | 3;
 
                 rsp -= 8; *(rsp as *mut u64) = user_data_selector; // SS
-                rsp -= 8; *(rsp as *mut u64) = user_stack_top;      // RSP usuario
+                rsp -= 8; *(rsp as *mut u64) = user_stack_top;      // user RSP
                 rsp -= 8; *(rsp as *mut u64) = 0x202;              // RFLAGS (IF=1)
                 rsp -= 8; *(rsp as *mut u64) = user_code_selector; // CS
-                rsp -= 8; *(rsp as *mut u64) = entry_point as usize as u64; // RIP → entry point del ELF
+                rsp -= 8; *(rsp as *mut u64) = entry_point as usize as u64; // RIP = ELF entry point
 
                 rsp -= 8; *(rsp as *mut u64) = user_mode_trampoline as *const () as u64;
-                
+
             } else {
                 rsp -= 8; *(rsp as *mut u64) = 0xDEAD_C0DE_DEAD_C0DE;
                 rsp -= 8; *(rsp as *mut u64) = entry_point as usize as u64;
@@ -128,11 +149,11 @@ impl Task {
         }
 
         let heap_start = 0x0000_0002_0000_0000; // 8 GiB virtual
-        let mmap_base  = 0x0000_4000_0000_0000; // 64 TiB virtual (NUEVO)
+        let mmap_base  = 0x0000_4000_0000_0000; // 64 TiB virtual
         let fd_table = FdTable::new();
 
         Ok(Self {
-            id, 
+            id,
             parent_id,
             rsp, pml4_frame, stack_start,
             stack_end: stack_top, _stack: stack,
@@ -144,16 +165,16 @@ impl Task {
         })
     }
 
+    /// Returns `true` iff `rsp` lies inside this task's kernel stack
+    /// range. Used by the scheduler to validate resumption points.
     pub fn is_valid_rsp(&self, rsp: u64) -> bool {
         rsp >= self.stack_start && rsp < self.stack_end
     }
 }
 
-// =======================================================
-// --- NUEVO: TRAMPOLÍN DE SALTO A ESPACIO DE USUARIO ---
-// =======================================================
-/// Pequeña función puente que usa los 5 valores insertados en 
-/// la pila por `Task::new` para forzar la bajada de privilegios a Ring 3.
+/// Tiny bridge that consumes the five values pushed on the stack
+/// by [`Task::new`] (SS, RSP, RFLAGS, CS, RIP) to force a privilege
+/// drop down to Ring 3 via `iretq`.
 #[unsafe(naked)]
 extern "C" fn user_mode_trampoline() {
     {
@@ -163,17 +184,21 @@ extern "C" fn user_mode_trampoline() {
     }
 }
 
-/// Cambio de contexto cooperativo/preemptivo entre dos tareas de kernel.
+/// Cooperative / preemptive context switch between two kernel tasks.
+///
+/// `old_rsp` receives the outgoing task's new RSP; `new_rsp` is the
+/// incoming task's saved RSP. Either pointer being null triggers an
+/// `int3` + `hlt` via label `2:`.
 #[unsafe(naked)]
 pub unsafe extern "sysv64" fn context_switch(old_rsp: *mut u64, new_rsp: u64) {
     core::arch::naked_asm!(
-        // Guardia: punteros nulos
+        // Guard: null pointers
         "test rdi, rdi",
         "jz 2f",
         "test rsi, rsi",
         "jz 2f",
 
-        // --- Guardar contexto de la tarea saliente ---
+        // --- Save outgoing task context ---
         "push r15",
         "push r14",
         "push r13",
@@ -181,16 +206,16 @@ pub unsafe extern "sysv64" fn context_switch(old_rsp: *mut u64, new_rsp: u64) {
         "push rbx",
         "push rbp",
         "pushfq",
-        // Fuerza IF=1 en el RFLAGS guardado
+        // Force IF=1 into the saved RFLAGS
         "or qword ptr [rsp], 0x200",
 
-        // Guardar RSP de la tarea saliente
+        // Save outgoing task RSP
         "mov [rdi], rsp",
 
-        // Cargar RSP de la tarea entrante
+        // Load incoming task RSP
         "mov rsp, rsi",
 
-        // --- Restaurar contexto de la tarea entrante ---
+        // --- Restore incoming task context ---
         "popfq",
         "pop rbp",
         "pop rbx",
@@ -199,10 +224,10 @@ pub unsafe extern "sysv64" fn context_switch(old_rsp: *mut u64, new_rsp: u64) {
         "pop r14",
         "pop r15",
 
-        // ret salta al entry_point (Kernel) o al user_mode_trampoline (Ring 3)
+        // ret jumps to entry_point (kernel) or user_mode_trampoline (Ring 3)
         "ret",
 
-        // Etiqueta de error
+        // Error label
         "2:",
         "int3",
         "hlt",

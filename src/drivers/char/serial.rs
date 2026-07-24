@@ -2,12 +2,19 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! 16550A-compatible UART serial port driver.
+//!
+//! Provides a tiny abstraction over the legacy 8250/16550 register
+//! file, the [`SERIAL1`] singleton for COM1 (`0x3F8`), and the
+//! `serial_print!` / `serial_println!` macros that the rest of the
+//! kernel uses as its log sink.
+
 use core::fmt;
 use spin::Mutex;
 use lazy_static::lazy_static;
 use x86_64::instructions::port::Port;
 
-/// Estructura que representa la capa física del puerto serie 8250 UART
+/// Physical layer of the 16550 UART: one I/O port per register.
 pub struct SerialPort {
     data: Port<u8>,
     int_en: Port<u8>,
@@ -18,7 +25,7 @@ pub struct SerialPort {
 }
 
 impl SerialPort {
-    /// Inicializa las direcciones de los puertos basándose en el puerto base (ej. 0x3F8 para COM1)
+    /// Builds a `SerialPort` rooted at `port_base` (e.g. `0x3F8` for COM1).
     pub const fn new(port_base: u16) -> Self {
         Self {
             data: Port::new(port_base),
@@ -30,33 +37,34 @@ impl SerialPort {
         }
     }
 
-    /// Configura el hardware con el protocolo estandar 8N1 a 38400 baudios
+    /// Configures the hardware with the standard 8N1 protocol at 38400 baud.
     pub fn init(&mut self) {
         unsafe {
-            self.int_en.write(0x00);    // 1. Desactivar todas las interrupciones del chip
-            self.line_ctrl.write(0x80); // 2. Activar bit DLAB (Para configurar velocidad)
-            self.data.write(0x03);      // 3. Divisor bajo (38400 baudios)
-            self.int_en.write(0x00);    //    Divisor alto
-            self.line_ctrl.write(0x03); // 4. 8 bits de datos, sin paridad, 1 bit de parada (8N1)
-            self.fifo_ctrl.write(0xC7); // 5. Habilitar FIFOs, limpiar buffers TX/RX, umbral 14 bytes
-            self.modem_ctrl.write(0x0B); // 6. Marcar el hardware como listo (RTS/DSR)
+            self.int_en.write(0x00);    // 1. Disable all chip interrupts.
+            self.line_ctrl.write(0x80); // 2. Set the DLAB bit to unlock the baud-rate divisor.
+            self.data.write(0x03);      // 3. Low divisor byte (38400 baud).
+            self.int_en.write(0x00);    //    High divisor byte.
+            self.line_ctrl.write(0x03); // 4. 8 data bits, no parity, 1 stop bit (8N1).
+            self.fifo_ctrl.write(0xC7); // 5. Enable FIFOs, clear TX/RX buffers, 14-byte threshold.
+            self.modem_ctrl.write(0x0B); // 6. Mark hardware as ready (RTS/DSR).
         }
     }
 
-    /// Espera en un spin loop hasta que el buffer del transmisor hardware esté vacío
+    /// Spins until the hardware transmit buffer is empty.
     fn wait_for_tx_empty(&mut self) {
         unsafe {
-            // El bit 5 del Line Status Register nos dice si podemos enviar datos
+            // Bit 5 of the Line Status Register tells us when the transmitter is ready.
             while (self.line_sts.read() & 0x20) == 0 {
-                core::hint::spin_loop(); // Le dice a la CPU que estamos esperando activamente
+                core::hint::spin_loop(); // Tell the CPU we are actively waiting.
             }
         }
     }
 
-    /// Envía un único byte al puerto
+    /// Sends a single byte to the port.
     pub fn send(&mut self, data: u8) {
         match data {
-            // En hardware de terminal clásico, un salto de línea requiere 'Retorno de Carro' y 'Salto de Línea'
+            // Classic terminal hardware requires both a Carriage Return
+            // and a Line Feed for a newline.
             b'\n' => {
                 self.wait_for_tx_empty();
                 unsafe { self.data.write(b'\r'); }
@@ -71,7 +79,7 @@ impl SerialPort {
     }
 }
 
-// Implementamos core::fmt::Write para poder usar la macro format_args! de Rust
+// Implement core::fmt::Write so the `format_args!` macro can drive the port.
 impl fmt::Write for SerialPort {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for byte in s.bytes() {
@@ -82,14 +90,14 @@ impl fmt::Write for SerialPort {
 }
 
 // ==========================================
-// CAPA DE SINCRONIZACIÓN Y MACROS
+// SYNCHRONISATION LAYER AND MACROS
 // ==========================================
 
 lazy_static! {
-    /// Bóveda global del puerto COM1. 
-    /// Se inicializa automáticamente la primera vez que se llama a serial_print!
+    /// Global vault for the COM1 port.
+    /// Initialised on first use of `serial_print!`.
     pub static ref SERIAL1: Mutex<SerialPort> = {
-        let mut serial_port = SerialPort::new(0x3F8); // 0x3F8 es el estándar inquebrantable para COM1
+        let mut serial_port = SerialPort::new(0x3F8); // 0x3F8 is the canonical, unbreakable standard for COM1.
         serial_port.init();
         Mutex::new(serial_port)
     };
@@ -100,16 +108,17 @@ pub fn _print(args: ::core::fmt::Arguments) {
     use core::fmt::Write;
     use x86_64::instructions::interrupts;
 
-    // EL ESCUDO ANTI-DEADLOCK:
-    // Deshabilitamos interrupciones de hardware locales justo antes de pedir el Mutex.
-    // Si no hacemos esto y una interrupción del temporizador salta mientras tenemos el candado,
-    // el manejador de interrupciones intentará imprimir, esperará el Mutex eternamente y la máquina colapsará.
+    // THE ANTI-DEADLOCK SHIELD:
+    // Disable local hardware interrupts right before taking the Mutex.
+    // Without this, a timer interrupt could fire while we hold the
+    // lock and the IRQ handler would try to print, blocking forever
+    // on the Mutex and hanging the machine.
     interrupts::without_interrupts(|| {
-        SERIAL1.lock().write_fmt(args).expect("Fallo crítico al imprimir en el puerto serie");
+        SERIAL1.lock().write_fmt(args).expect("Critical failure while printing to the serial port");
     });
 }
 
-/// Imprime en el puerto serie anfitrión
+/// Prints to the host serial port.
 #[macro_export]
 macro_rules! serial_print {
     ($($arg:tt)*) => {
@@ -117,7 +126,7 @@ macro_rules! serial_print {
     };
 }
 
-/// Imprime en el puerto serie anfitrión con un salto de línea
+/// Prints to the host serial port followed by a newline.
 #[macro_export]
 macro_rules! serial_println {
     () => ($crate::serial_print!("\n"));

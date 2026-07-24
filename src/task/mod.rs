@@ -2,6 +2,15 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Multitasking layer: the per-task [`Task`] model, the
+//! [`TaskManager`] that owns every runnable task, the round-robin
+//! [`scheduler`], the ELF loader ([`elf`]) and the Ring 3 entry
+//! helper ([`usermode`]).
+//!
+//! The public surface is small on purpose: the rest of the kernel
+//! interacts with the subsystem through [`init_multitasking`] (boot)
+//! and [`with_task_manager`] (everywhere else).
+
 pub mod task;
 pub mod task_manager;
 pub mod scheduler;
@@ -11,11 +20,15 @@ pub mod elf;
 pub use task::{context_switch, PrivilegeLevel, Task, TaskContext, TaskId};
 pub use task_manager::{init_task_manager, with_task_manager, TaskManager, TaskManagerStats, TaskState, TASK_MANAGER};
 
+/// Boots the multitasking subsystem: initialises the
+/// [`TaskManager`], spawns the kernel reaper daemon and, if a
+/// `shell.elf` is present in the initramfs, deploys it as a
+/// Ring 3 user task.
 pub fn init_multitasking() {
     let (current_pml4, _) = x86_64::registers::control::Cr3::read();
     crate::task::init_task_manager();
-    
-    // TAREA 1: EL HILO DEL SEGADOR (DAEMON RING 0)
+
+    // TASK 1: THE REAPER THREAD (DAEMON, RING 0)
     fn hilo_segador() -> ! {
         use alloc::vec::Vec;
         crate::serial_println!("[DAEMON] Reaper thread online. Sleeping...");
@@ -44,13 +57,13 @@ pub fn init_multitasking() {
         }
     }
 
-    // INICIALIZACIÓN CENTRAL (EL BIG BANG DE LAS TAREAS)
+    // CENTRAL INITIALISATION (THE BIG BANG OF TASKS)
     //
-    // Fase 7: las 4 ramas de panic usan Display `{}` en lugar de Debug
-    // `{:?}` para mantener consistencia con la Fase 5 (panic_handler) y
-    // para que el KernelError se imprima con su formato legible de campo
+    // Phase 7: the four panic branches use Display `{}` instead of
+    // Debug `{:?}` to stay consistent with Phase 5 (panic_handler) and
+    // so that the KernelError prints with its readable field format
     // (`KERNEL:TASK:StackAllocation (64 KiB heap reservation failed)`)
-    // en vez del volcado Rust crudo.
+    // rather than the raw Rust dump.
     crate::task::with_task_manager(|tm| {
         if let Err(e) = tm.spawn(hilo_segador, current_pml4, crate::task::PrivilegeLevel::KernelMode) {
             panic!("FATAL: Failed to spawn Reaper daemon. Error: {}", e);
@@ -60,14 +73,14 @@ pub fn init_multitasking() {
         if let Some(elf_slice) = crate::fs::vfs::find_file(nombre_archivo) {
             if let Some(target_pml4) = crate::mm::memory::create_isolated_pml4() {
 
-                // Fase 7: load_elf sigue devolviendo ElfError; usamos
-                // `.into()` (que activa From<ElfError> for KernelError,
-                // Fase 2.1) en lugar de re-empaquetar manualmente con
-                // SystemError::ElfParseFailed. El resultado en rax / log
-                // es equivalente (el kernel_err -> to_errno produce -ENOEXEC),
-                // pero el codigo es mas limpio y aprovecha la taxonomia
-                // consolidada: el ElfError se canaliza ahora como
-                // FsError::Elf (que es el envoltorio canonico desde Fase 1.5).
+                // Phase 7: load_elf still returns ElfError; we use
+                // `.into()` (which activates From<ElfError> for KernelError,
+                // Phase 2.1) instead of re-wrapping it manually with
+                // SystemError::ElfParseFailed. The result in rax / log is
+                // equivalent (kernel_err -> to_errno produces -ENOEXEC),
+                // but the code is cleaner and reuses the consolidated
+                // taxonomy: the ElfError is now channeled as FsError::Elf
+                // (the canonical wrapper since Phase 1.5).
                 let load_result: Result<u64, crate::core::error::KernelError> =
                     crate::task::elf::load_elf(elf_slice, target_pml4)
                         .map_err(|e| e.into());
@@ -90,6 +103,6 @@ pub fn init_multitasking() {
         } else { panic!("FATAL: '{}' not found in Initramfs TAR.", nombre_archivo); }
     });
     
-    crate::println!("[OK] TaskManager y Scheduler asincrono en linea.");
+    crate::println!("[OK] TaskManager and async Scheduler online.");
     crate::core::idt::reload();
 }

@@ -2,22 +2,33 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/drivers/block/ahci/regs.rs
+//! AHCI register layout and ATA command opcodes.
+//!
+//! Pure data definitions: a `Volatile<T>` wrapper around MMIO
+//! registers, the HBA control/status bitflags and the subset of ATA
+//! commands the driver issues. Runtime logic lives in [`super::port`].
 
 use core::ptr::{read_volatile, write_volatile};
 
+/// Transparent wrapper that forces every access to go through
+/// `read_volatile`/`write_volatile`, preventing the compiler from
+/// reordering or coalescing MMIO operations.
 #[repr(transparent)]
 pub struct Volatile<T>(T);
 
 impl<T> Volatile<T> {
+    /// Reads the wrapped value through a volatile load.
     pub fn read(&self) -> T {
         unsafe { read_volatile(&self.0) }
     }
+
+    /// Writes `value` through a volatile store.
     pub fn write(&mut self, value: T) {
         unsafe { write_volatile(&mut self.0, value) }
     }
 }
 
+// Bits of the HBA host control register (`HBA_MEM::ghc`).
 bitflags::bitflags! {
     pub struct HbaHostCont: u32 {
         const HR =   1 << 0;  // HBA Reset
@@ -27,6 +38,7 @@ bitflags::bitflags! {
     }
 }
 
+// Bits of the per-port command register (`HBA_PORT::cmd`).
 bitflags::bitflags! {
     pub struct HbaPortCmd: u32 {
         const ST =  1 << 0;  // Start
@@ -39,6 +51,7 @@ bitflags::bitflags! {
     }
 }
 
+/// Subset of ATA command opcodes issued by the AHCI driver.
 #[derive(Debug, PartialEq, Copy, Clone)]
 #[repr(u8)]
 pub enum AtaCommand {

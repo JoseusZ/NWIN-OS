@@ -2,7 +2,10 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/drivers/block/ahci.rs
+//! AHCI driver: HBA memory layout, MMIO initialisation and SATA
+//! device probing. The driver owns the hardware bring-up and hands
+//! each detected disk off to the FS layer via
+//! [`crate::fs::manager::process_disk`].
 
 pub mod regs;
 pub mod port;
@@ -15,6 +18,11 @@ use x86_64::registers::control::Cr3;
 use alloc::sync::Arc;
 use crate::drivers::block::AhciDisk;
 
+/// Host Bus Adapter memory-mapped register file.
+///
+/// The first 0x100 bytes hold the generic HBA control/status
+/// registers; the next 32 * 128 bytes are the per-port register
+/// files (one [`HbaPort`] per SATA port).
 #[repr(C)]
 pub struct HbaMemory {
     pub host_capability: Volatile<u32>,
@@ -33,21 +41,24 @@ pub struct HbaMemory {
     pub ports: [HbaPort; 32], 
 }
 
+/// Brings up the AHCI controller whose BAR5 MMIO base is
+/// `bar5_address` and probes every implemented port for a SATA
+/// device. Each detected disk is handed to the FS layer.
 pub fn init(bar5_address: u32) {
-    crate::serial_println!("[AHCI] Inicializando driver en memoria fisica: {:#010x}", bar5_address);
-    
-    let hhdm_offset = VirtAddr::new(crate::HHDM_REQUEST.response().expect("Fallo HHDM").offset);
+    crate::serial_println!("[AHCI] Initialising driver at physical address: {:#010x}", bar5_address);
+
+    let hhdm_offset = VirtAddr::new(crate::HHDM_REQUEST.response().expect("HHDM failed").offset);
     let virtual_bar5 = VirtAddr::new((bar5_address as u64) + hhdm_offset.as_u64());
 
     // =========================================================
-    // MAPEO EXPLÍCITO DE MMIO EN LAS TABLAS DE PÁGINAS
+    // EXPLICIT MMIO MAPPING IN THE PAGE TABLES
     // =========================================================
     let (level_4_table_frame, _) = Cr3::read();
     let phys_to_virt = |frame: PhysFrame| -> *mut PageTable {
         let virt = hhdm_offset + frame.start_address().as_u64();
         virt.as_mut_ptr()
     };
-    
+
     let level_4_table = unsafe { &mut *phys_to_virt(level_4_table_frame) };
     let mut mapper = unsafe { OffsetPageTable::new(level_4_table, hhdm_offset) };
     let mut frame_allocator = crate::mm::memory::SystemFrameAllocator;
@@ -56,16 +67,16 @@ pub fn init(bar5_address: u32) {
         let offset = i * 4096;
         let page = Page::<Size4KiB>::containing_address(virtual_bar5 + offset);
         let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new((bar5_address as u64) + offset));
-        
-        let flags = PageTableFlags::PRESENT 
-                  | PageTableFlags::WRITABLE 
-                  | PageTableFlags::NO_CACHE 
+
+        let flags = PageTableFlags::PRESENT
+                  | PageTableFlags::WRITABLE
+                  | PageTableFlags::NO_CACHE
                   | PageTableFlags::WRITE_THROUGH;
 
         unsafe {
             match mapper.map_to(page, frame, flags, &mut frame_allocator) {
                 Ok(mapping) => mapping.flush(),
-                Err(e) => crate::serial_println!("[AHCI] Advertencia de mapeo: {:?}", e),
+                Err(e) => crate::serial_println!("[AHCI] Mapping warning: {:?}", e),
             }
         }
     }
@@ -77,13 +88,13 @@ pub fn init(bar5_address: u32) {
     hba_mem.global_host_control.write(host_ctrl.bits());
 
     let ports_impl = hba_mem.ports_implemented.read();
-    crate::serial_println!("[AHCI] Mapa de puertos implementados: {:#034b}", ports_impl);
+    crate::serial_println!("[AHCI] Implemented ports bitmap: {:#034b}", ports_impl);
 
     for i in 0..32 {
         if (ports_impl & (1 << i)) != 0 {
             let port = &mut hba_mem.ports[i];
             let sata_status = port.ssts.read();
-            
+
             let device_detection = sata_status & 0x0F;
             let power_management = (sata_status >> 8) & 0x0F;
 
@@ -91,33 +102,33 @@ pub fn init(bar5_address: u32) {
                 let sig = port.sig.read();
 
                 if sig == 0xEB140101 {
-                    crate::serial_println!("[AHCI] -> Lector de CD-ROM (ATAPI) detectado en el puerto {}. Ignorando.", i);
-                    continue; 
+                    crate::serial_println!("[AHCI] -> ATAPI CD-ROM reader detected on port {}. Ignoring.", i);
+                    continue;
                 } else if sig == 0x00000101 {
-                    crate::serial_println!("[AHCI] -> Disco duro (ATA) detectado en el puerto SATA {}. Motor encendido y DMA configurado.", i);
-                    
+                    crate::serial_println!("[AHCI] -> ATA hard disk detected on SATA port {}. Engine on, DMA configured.", i);
+
                     // ==========================================
-                    // CONFIGURACIÓN DMA DEL PUERTO ATA
+                    // ATA PORT DMA CONFIGURATION
                     // ==========================================
                     port.stop_cmd();
 
                     let dma_frames_phys = crate::mm::memory::get_allocator()
                         .allocate_contiguous_frames(3)
-                        .expect("PANICO: Sin memoria contigua para AHCI DMA");
-                    
+                        .expect("PANIC: no contiguous memory for AHCI DMA");
+
                     let dma_frames_virt = hhdm_offset.as_u64() + dma_frames_phys;
 
                     unsafe { core::ptr::write_bytes(dma_frames_virt as *mut u8, 0, 4096 * 3); }
 
                     port.clb.write((dma_frames_phys & 0xFFFFFFFF) as u32);
                     port.clbu.write((dma_frames_phys >> 32) as u32);
-                    
+
                     let fb_phys = dma_frames_phys + 1024;
                     port.fb.write((fb_phys & 0xFFFFFFFF) as u32);
                     port.fbu.write((fb_phys >> 32) as u32);
 
-                    let headers_slice = unsafe { 
-                        core::slice::from_raw_parts_mut(dma_frames_virt as *mut HbaCmdHeader, 32) 
+                    let headers_slice = unsafe {
+                        core::slice::from_raw_parts_mut(dma_frames_virt as *mut HbaCmdHeader, 32)
                     };
 
                     for slot in 0..32 {
@@ -136,8 +147,10 @@ pub fn init(bar5_address: u32) {
                     });
 
                     // ==========================================
-                    // DELEGACIÓN LIMPIA (SRP)
-                    // El driver solo entrega el hardware, el manager se encarga del resto.
+                    // CLEAN DELEGATION (SRP)
+                    // The driver only hands the hardware over; the manager
+                    // owns the rest of the bring-up (FS probing, mounting,
+                    // smoke tests).
                     // ==========================================
                     crate::fs::manager::process_disk(disk);
                 }

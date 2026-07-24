@@ -7,44 +7,45 @@ use spin::Mutex;
 use core::sync::atomic::{AtomicU64, Ordering};
 use crate::task::{PrivilegeLevel, Task, TaskId};
 
-// ========================================================
-// ESTADOS LÓGICOS DE UNA TAREA (Estilo Linux)
-// ========================================================
+// Centralised owner of every task, its state, the ready queue and the
+// current-task pointer. The single instance lives in the
+// [`TASK_MANAGER`] static and is mutated only through
+// [`with_task_manager`] (which disables interrupts around the lock).
+
+/// Logical lifecycle state of a task (Linux-style).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
-    /// Lista para ejecutarse en la CPU
+    /// Ready to run on the CPU.
     Ready,
-    /// Actualmente en ejecución
+    /// Currently executing.
     Running,
-    /// Durmiendo/Esperando un Mutex, E/S o evento
+    /// Sleeping, waiting on a mutex, I/O or event.
     Blocked,
-    /// Terminada (Zombie/Dead) y esperando a ser limpiada
+    /// Terminated and waiting for the reaper to reclaim it.
     Dead,
 }
 
-// ========================================================
-// GESTOR DE TAREAS (TASK MANAGER)
-// ========================================================
-/// Gestor centralizado de todas las tareas del kernel
+/// Centralised task manager of the kernel.
 pub struct TaskManager {
-    /// Cola de tareas LISTAS para ejecutarse (Solo tareas en estado 'Ready')
+    /// FIFO queue of tasks in the [`TaskState::Ready`] state.
     pub ready_queue: VecDeque<TaskId>,
-    
-    /// Registro centralizado absoluto de todas las tareas y sus metadatos
+
+    /// Authoritative registry of every task and its metadata.
     pub task_registry: BTreeMap<TaskId, Task>,
-    
-    /// Estado de cada tarea (El Semáforo)
+
+    /// Per-task state map (the "semaphore").
     pub task_states: BTreeMap<TaskId, TaskState>,
-    
-    /// Tarea actualmente ejecutándose (Ring 0)
+
+    /// Task currently executing on the CPU (Ring 0).
     pub current_task: Option<TaskId>,
-    
-    /// Contador maestro de tics del sistema (Uptime)
+
+    /// Master tick counter of the system (uptime).
     pub ticks: AtomicU64,
 }
 
 impl TaskManager {
-    /// Constructor constante para inicializar el STATIC global sin asignación dinámica temprana.
+    /// `const` constructor used to initialise the [`TASK_MANAGER`]
+    /// static without early dynamic allocation.
     pub const fn empty() -> Self {
         Self {
             ready_queue: VecDeque::new(),
@@ -55,26 +56,28 @@ impl TaskManager {
         }
     }
 
-    /// Agrega la tarea al final de la cola (Útil para re-encolar hilos vivos)
+    /// Appends a task to the back of the ready queue (idempotent).
     pub fn mark_ready(&mut self, id: TaskId) {
         if !self.ready_queue.contains(&id) {
             self.ready_queue.push_back(id);
         }
     }
 
-    /// Extrae la siguiente tarea de la cola de forma atómica (Para el Scheduler)
+    /// Pops the next task from the front of the ready queue.
     pub fn fetch_next_task(&mut self) -> Option<TaskId> {
         self.ready_queue.pop_front()
     }
 
-    /// Crea una nueva tarea y la enciende marcándola como 'Ready'
+    /// Creates a new task and immediately marks it as [`TaskState::Ready`].
+    ///
+    /// The current task becomes the parent (lineage tracking).
     pub fn spawn(
         &mut self,
         entry_point: fn() -> !,
         pml4_frame: x86_64::structures::paging::PhysFrame,
         privilege: PrivilegeLevel,
     ) -> Result<TaskId, crate::core::error::KernelError> {
-        
+
         let parent_id = self.current_task;
 
         let task = Task::new(
@@ -82,42 +85,47 @@ impl TaskManager {
             pml4_frame,
             privilege,
             0,
-            parent_id, // <-- INYECTAMOS EL LINAJE
-        )?; 
-        
+            parent_id,
+        )?;
+
         let task_id = task.id;
         self.task_registry.insert(task_id, task);
         self.set_task_state(task_id, TaskState::Ready);
-        
+
         Ok(task_id)
     }
 
+    /// Blocks the current task until `child_id` reaches [`TaskState::Dead`].
+    ///
+    /// Returns `true` if the parent was successfully parked, `false`
+    /// if the child was already dead or does not exist.
     pub fn wait_for_child(&mut self, child_id: TaskId) -> bool {
         if let Some(&state) = self.task_states.get(&child_id) {
             if state != TaskState::Dead {
                 self.block_current_task();
-                return true; // El padre se durmió con éxito
+                return true; // parent slept successfully
             }
         }
-        false // El hijo ya murió o no existe
+        false // child already dead or does not exist
     }
 
-    /// Manejador seguro de estados (El Semáforo de Linux)
+    /// Linux-style "semaphore" transition: updates the task state and
+    /// keeps the ready queue in sync (enqueue on Ready, dequeue on
+    /// any other state).
     pub fn set_task_state(&mut self, task_id: TaskId, state: TaskState) {
         let old_state = self.task_states.insert(task_id, state).unwrap_or(TaskState::Dead);
-        
+
         if state == TaskState::Ready && old_state != TaskState::Ready {
-            // Si despierta o nace, la ponemos en la cola de ejecución
             self.ready_queue.push_back(task_id);
         } else if state != TaskState::Ready && old_state == TaskState::Ready {
-            // Si se bloquea, la buscamos y la sacamos de la cola de listos
             self.ready_queue.retain(|&id| id != task_id);
         }
     }
 
-    /// NOTA DE AUDITORÍA (BUG 3): Esta función antigua mezclaba la obtención con la mutación
-    /// de 'current_task' de forma peligrosa. Se conserva por compatibilidad, pero se recomienda
-    /// delegar el control de estados finos directamente al `scheduler.rs` usando `fetch_next_task`.
+    /// AUDIT NOTE (BUG 3): this legacy function mixed the read of
+    /// `current_task` with its mutation in a dangerous way. It is kept
+    /// for compatibility, but callers should delegate fine-grained
+    /// state control to `scheduler.rs` via [`fetch_next_task`].
     pub fn next_task(&mut self) -> Option<TaskId> {
         if let Some(prev_id) = self.current_task {
             if let Some(&state) = self.task_states.get(&prev_id) {
@@ -137,25 +145,24 @@ impl TaskManager {
         }
     }
 
-    /// Bloquea la tarea actual. El scheduler la saltará en el próximo ciclo.
+    /// Blocks the current task. The scheduler will skip it on the next cycle.
     pub fn block_current_task(&mut self) {
         if let Some(id) = self.current_task {
             self.set_task_state(id, TaskState::Blocked);
         }
     }
 
+    /// Marks the current task as [`TaskState::Dead`] and detaches it
+    /// from the CPU so the scheduler is forced to pick a new task on
+    /// the next PIT tick.
     pub fn exit_current_task(&mut self) {
         if let Some(id) = self.current_task {
-            // 1. Cambiamos el estado a Dead (El semáforo la saca de la cola de Listos)
             self.set_task_state(id, TaskState::Dead);
-            
-            // 2. Desvinculamos la tarea de la CPU actual para que el Scheduler 
-            // se vea obligado a elegir una nueva tarea en el próximo ciclo del PIT.
             self.current_task = None;
         }
     }
 
-    /// Despierta una tarea específica
+    /// Wakes a specific task if it is currently [`TaskState::Blocked`].
     pub fn unblock_task(&mut self, task_id: TaskId) {
         if let Some(&state) = self.task_states.get(&task_id) {
             if state == TaskState::Blocked {
@@ -164,24 +171,24 @@ impl TaskManager {
         }
     }
 
-    // --- MANEJO DE REGISTROS Y LIMPIEZA ---
-
+    /// Returns the saved kernel RSP of `task_id`, if it exists.
     pub fn get_rsp(&self, task_id: TaskId) -> Option<u64> {
         self.task_registry.get(&task_id).map(|t| t.rsp)
     }
 
+    /// Updates the saved kernel RSP of `task_id`, no-op if unknown.
     pub fn set_rsp(&mut self, task_id: TaskId, rsp: u64) {
         if let Some(task) = self.task_registry.get_mut(&task_id) {
             task.rsp = rsp;
         }
     }
 
+    /// Removes a task from the registry. If the killed task had a
+    /// parent that was [`TaskState::Blocked`] (typically waiting via
+    /// [`wait_for_child`]), the parent is woken up to [`TaskState::Ready`].
     pub fn kill(&mut self, task_id: TaskId) -> Option<Task> {
         self.set_task_state(task_id, TaskState::Dead);
-        
-        // --- EL DESPERTADOR IPC ---
-        // Si la tarea que estamos matando tiene un padre, y ese padre 
-        // está durmiendo (Blocked), lo despertamos pasándolo a Ready.
+
         if let Some(task) = self.task_registry.get(&task_id) {
             if let Some(parent_id) = task.parent_id {
                 if let Some(&parent_state) = self.task_states.get(&parent_id) {
@@ -196,6 +203,8 @@ impl TaskManager {
         self.task_registry.remove(&task_id)
     }
 
+    /// Snapshot of high-level metrics (live + ready count, current task,
+    /// tick counter).
     pub fn stats(&self) -> TaskManagerStats {
         TaskManagerStats {
             total_tasks: self.task_registry.len(),
@@ -205,32 +214,33 @@ impl TaskManager {
         }
     }
 
+    /// Spawns a Ring 3 user task, inheriting the current task as its parent.
     pub fn spawn_dynamic(
         &mut self,
         entry_point: fn() -> !,
         target_pml4: x86_64::structures::paging::PhysFrame,
         user_stack_top: u64,
-    ) -> Result<TaskId, crate::core::error::KernelError> { 
-        
-        let parent_id = self.current_task; // <-- CAPTURAMOS AL PADRE (Ej. La Shell)
+    ) -> Result<TaskId, crate::core::error::KernelError> {
+
+        let parent_id = self.current_task;
 
         let task = Task::new(
             entry_point,
             target_pml4,
             PrivilegeLevel::UserMode,
             user_stack_top,
-            parent_id, // <-- INYECTAMOS EL LINAJE
-        )?; 
-        
+            parent_id,
+        )?;
+
         let task_id = task.id;
         self.task_registry.insert(task_id, task);
         self.set_task_state(task_id, TaskState::Ready);
-        
-        Ok(task_id) 
+
+        Ok(task_id)
     }
 }
-// --- ESTRUCTURAS GLOBALES Y PÚBLICAS ---
 
+/// Snapshot of [`TaskManager`] metrics returned by [`TaskManager::stats`].
 pub struct TaskManagerStats {
     pub total_tasks: usize,
     pub ready_tasks: usize,
@@ -238,17 +248,21 @@ pub struct TaskManagerStats {
     pub ticks: u64,
 }
 
+/// Global singleton. Mutated only through [`with_task_manager`].
 pub static TASK_MANAGER: Mutex<TaskManager> = Mutex::new(TaskManager::empty());
 
+/// Initialises the static task manager (currently a no-op placeholder).
 pub fn init_task_manager() {
-    crate::println!("[OK] TaskManager inicializado.");
+    crate::println!("[OK] TaskManager initialised.");
 }
 
+/// Acquires the [`TASK_MANAGER`] lock with interrupts disabled, which
+/// is the only safe way to mutate task state from any context
+/// (including interrupt handlers).
 pub fn with_task_manager<F, R>(f: F) -> R
 where
     F: FnOnce(&mut TaskManager) -> R,
 {
-   
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut tm = TASK_MANAGER.lock();
         f(&mut tm)

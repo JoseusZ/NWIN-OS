@@ -2,9 +2,15 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Raw linear framebuffer abstraction.
+//!
+//! Layer 1 of the display stack: a minimal wrapper around the
+//! memory-mapped framebuffer that Limine/UEFI hands us, exposing
+//! only the operations the TTY layer above needs.
+
 use font8x8::{BASIC_FONTS, UnicodeFonts};
 
-/// Capa 1: Abstracción de Hardware (Framebuffer)
+/// Layer 1: hardware abstraction over a linear framebuffer.
 pub struct FrameBuffer {
     pub ptr: *mut u8,
     pub width: usize,
@@ -17,10 +23,15 @@ unsafe impl Send for FrameBuffer {}
 unsafe impl Sync for FrameBuffer {}
 
 impl FrameBuffer {
+    /// Builds a framebuffer over the linear pixel buffer at `ptr`,
+    /// with the given resolution, `pitch` (bytes per scanline) and
+    /// `bpp` (bits per pixel; the constructor converts to bytes).
     pub fn new(ptr: *mut u8, width: usize, height: usize, pitch: usize, bpp: usize) -> Self {
         Self { ptr, width, height, pitch, bytes_per_pixel: bpp / 8 }
     }
 
+    /// Plots a single RGB pixel at `(x, y)`, silently ignoring
+    /// out-of-bounds coordinates.
     #[inline(always)]
     pub fn draw_pixel(&mut self, x: usize, y: usize, color: [u8; 3]) {
         if x < self.width && y < self.height {
@@ -33,7 +44,8 @@ impl FrameBuffer {
         }
     }
 
-    /// Dibuja un bloque sólido (ideal para limpiar pantalla, borrar letras y el cursor)
+    /// Fills a solid `w x h` rectangle with `color`, useful for
+    /// clearing the screen, erasing glyphs and drawing the cursor.
     pub fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: [u8; 3]) {
         for row_i in 0..h {
             for col_i in 0..w {
@@ -42,7 +54,7 @@ impl FrameBuffer {
         }
     }
 
-    /// Limpia toda la pantalla ultrarápido
+    /// Ultra-fast whole-screen clear to `color`.
     pub fn clear(&mut self, color: [u8; 3]) {
         for y in 0..self.height {
             for x in 0..self.width {
@@ -56,7 +68,8 @@ impl FrameBuffer {
         }
     }
 
-    /// Extrae un glifo y lo dibuja píxel por píxel
+    /// Rasterises a single 8x8 glyph from the `font8x8` font table
+    /// at `(x, y)`, using `fg` for set bits and `bg` for cleared bits.
     pub fn draw_char(&mut self, x: usize, y: usize, byte: u8, fg: [u8; 3], bg: [u8; 3]) {
         let glyph = BASIC_FONTS.get(byte as char).unwrap_or([0; 8]); 
         for (row_i, row) in glyph.iter().enumerate() {

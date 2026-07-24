@@ -2,7 +2,13 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// src/fs/ext4/mod.rs
+//! ext2/3/4 filesystem driver.
+//!
+//! Exposes ext4 volumes through the kernel's [`VNode`] abstraction:
+//! [`Ext4Node`] handles extent-tree-based block reads and directory
+//! entry iteration, while the supporting submodules own the on-disk
+//! structures ([`super_block`], [`inode`], [`extents`], [`block_group`],
+//! [`dir_entry`]) and the high-level volume operations ([`volume`]).
 
 pub mod super_block;
 pub mod inode;
@@ -27,12 +33,12 @@ pub struct Ext4Node {
 }
 
 impl Ext4Node {
-    /// Construye el nodo raíz de Ext4 (Inodo 2) leyendo directamente del disco
+    /// Builds the root node of Ext4 (Inode 2) by reading it directly from the disk.
     pub fn new_root(volume: Arc<Ext4Volume>) -> Self {
-        let inode_num = 2; // El Inodo 2 siempre es la carpeta raíz en Linux
-        
+        let inode_num = 2; // Inode 2 is always the root directory in Linux.
+
         let inode = volume.read_inode(inode_num).unwrap_or_else(|_| unsafe { core::mem::zeroed() });
-        
+
         let is_dir = inode.is_directory();
         let size = inode.size() as usize;
 
@@ -45,54 +51,51 @@ impl Ext4Node {
         }
     }
 
-    /// Getter para acceder al número de inodo respetando la encapsulación (Esto elimina el warning)
+    /// Getter to access the inode number while preserving encapsulation (this removes the warning).
     pub fn inode_num(&self) -> u32 {
         self.inode_num
     }
 
 
-    /// Añade una nueva entrada a este directorio encogiendo el padding
-    /// de la última entrada.
+    /// Adds a new entry to this directory by shrinking the padding of the last entry.
     ///
-    /// **Fase 3.3:** Migrado a `Result<(), FsError>`. Reglas de mapeo:
-    /// - `!is_directory` → `FsError::CorruptedDirectory` (invariante
-    ///   estructural del VNode).
-    /// - `logical_to_physical_sector` falla → `FsError::CorruptedDirectory`
-    ///   (inodo con extents corruptos o vacios para un directorio).
-    /// - `read_block` / `write_block` → `FsError::BlockRead` /
-    ///   `FsError::BlockWrite`.
-    /// - Sin espacio de padding → `FsError::NoSpace`.
-    /// - `rec_len == 0` o desbordamiento → `FsError::CorruptedDirectory`.
+    /// **Phase 3.3:** Migrated to `Result<(), FsError>`. Mapping rules:
+    /// - `!is_directory` → `FsError::CorruptedDirectory` (structural VNode invariant).
+    /// - `logical_to_physical_sector` fails → `FsError::CorruptedDirectory` (inode with
+    ///   corrupted or empty extents for a directory).
+    /// - `read_block` / `write_block` → `FsError::BlockRead` / `FsError::BlockWrite`.
+    /// - No padding space → `FsError::NoSpace`.
+    /// - `rec_len == 0` or overflow → `FsError::CorruptedDirectory`.
     pub fn add_entry(&self, name: &str, inode_num: u32) -> Result<(), FsError> {
         if !self.is_directory { return Err(FsError::CorruptedDirectory); }
 
         let block_size = self.volume.super_block.block_size() as usize;
         let mut buffer = alloc::vec![0u8; block_size];
 
-        // 1. Ubicamos el sector fisico del bloque del directorio (Bloque logico 0 del Inodo 2)
+        // 1. Locate the physical sector of the directory block (logical block 0 of Inode 2)
         let physical_sector = self.volume.logical_to_physical_sector(&self.inode, 0)
             .ok_or(FsError::CorruptedDirectory)?;
 
-        // 2. Leemos el bloque completo (4096 bytes = 8 sectores)
+        // 2. Read the full block (4096 bytes = 8 sectors)
         for i in 0..(block_size / 512) {
             self.volume.device
                 .read_block(physical_sector + i as u64, &mut buffer[i * 512 .. (i + 1) * 512])
                 .map_err(|_| FsError::BlockRead)?;
         }
 
-        // 3. Recorremos los registros hasta encontrar el último (el que tiene el padding sobrante)
+        // 3. Walk the records until we find the last one (the one that owns the trailing padding)
         let mut offset = 0;
         loop {
             let entry_ptr = unsafe { buffer.as_ptr().add(offset) as *const Ext4DirEntryHeader };
             let rec_len = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*entry_ptr).rec_len)) } as usize;
             let name_len = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*entry_ptr).name_len)) } as usize;
 
-            // Si este registro abarca hasta el final exacto del bloque de 4096 bytes... ¡Es el último!
+            // If this record spans exactly to the end of the 4096-byte block... it's the last one!
             if offset + rec_len == block_size {
-                
-                // Calculamos cuánto espacio realmente ocupa
+
+                // Compute the actual size taken by this record
                 let real_len = 8 + name_len;
-                let aligned_len = (real_len + 3) & !3; // Alinear a múltiplos de 4 bytes
+                let aligned_len = (real_len + 3) & !3; // Align to multiples of 4 bytes
 
                 let space_left = rec_len - aligned_len;
                 let new_entry_real = 8 + name.len();
@@ -102,28 +105,28 @@ impl Ext4Node {
                     return Err(FsError::NoSpace);
                 }
 
-                // A. Encogemos la entrada actual modificando su rec_len en la memoria RAM
+                // A. Shrink the current entry by editing its rec_len in RAM
                 unsafe {
                     let entry_mut = &mut *(buffer.as_mut_ptr().add(offset) as *mut Ext4DirEntryHeader);
                     core::ptr::write_unaligned(core::ptr::addr_of_mut!(entry_mut.rec_len), aligned_len as u16);
                 }
 
                 let new_offset = offset + aligned_len;
-                
-                // B. Construimos nuestra nueva entrada byte a byte usando punteros para máxima seguridad
+
+                // B. Build our new entry byte by byte using pointers for maximum safety
                 unsafe {
                     let new_entry_ptr = buffer.as_mut_ptr().add(new_offset);
-                    
+
                     // Inode (4 bytes)
                     core::ptr::write_unaligned(new_entry_ptr as *mut u32, inode_num);
-                    // Rec_len (2 bytes, offset 4) - Se lleva todo el padding sobrante
+                    // Rec_len (2 bytes, offset 4) - takes the entire leftover padding
                     core::ptr::write_unaligned(new_entry_ptr.add(4) as *mut u16, space_left as u16);
                     // Name_len (1 byte, offset 6)
                     core::ptr::write_unaligned(new_entry_ptr.add(6) as *mut u8, name.len() as u8);
-                    // File_type (1 byte, offset 7) -> 1 = Archivo regular
+                    // File_type (1 byte, offset 7) -> 1 = Regular file
                     core::ptr::write_unaligned(new_entry_ptr.add(7) as *mut u8, 1);
-                    
-                    // C. Copiamos el nombre de tu archivo (Empieza en el offset 8)
+
+                    // C. Copy the file name (starts at offset 8)
                     core::ptr::copy_nonoverlapping(name.as_ptr(), new_entry_ptr.add(8), name.len());
                 }
                 break;
@@ -133,7 +136,7 @@ impl Ext4Node {
             if offset >= block_size || rec_len == 0 { return Err(FsError::CorruptedDirectory); }
         }
 
-        // 4. Quemamos el directorio actualizado en el disco
+        // 4. Burn the updated directory back to the disk
         for i in 0..(block_size / 512) {
             self.volume.device
                 .write_block(physical_sector + i as u64, &buffer[i * 512 .. (i + 1) * 512])
@@ -154,64 +157,64 @@ impl VNode for Ext4Node {
         self.size
     }
 
-    /// Busca un archivo por nombre dentro de este directorio
+    /// Searches a file by name inside this directory.
     fn lookup(&self, name: &str) -> Option<Arc<dyn VNode>> {
         if !self.is_directory { return None; }
 
-        // Sonda 1: Confirmamos que estamos en el inodo correcto y el tamaño
-        crate::serial_println!("[EXT4-DEBUG] Iniciando búsqueda de '{}' en Inodo {}. Tamaño a leer: {} bytes", name, self.inode_num, self.size);
+        // Probe 1: Confirm we are at the correct inode and inspect the size to read.
+        crate::serial_println!("[EXT4-DEBUG] Starting lookup of '{}' in Inode {}. Size to read: {} bytes", name, self.inode_num, self.size);
 
         let mut buffer = alloc::vec![0u8; self.size];
         let bytes_read = self.read(0, &mut buffer);
-        
-        // Sonda 2: Confirmamos si el motor DMA de Extents logró leer los datos físicos
-        crate::serial_println!("[EXT4-DEBUG] El motor DMA devolvió {} bytes de datos.", bytes_read);
+
+        // Probe 2: Confirm whether the Extents DMA engine managed to read the physical data.
+        crate::serial_println!("[EXT4-DEBUG] The DMA engine returned {} bytes of data.", bytes_read);
 
         if bytes_read == 0 {
-            // Si devuelve 0, leemos el Header del Extent para saber por qué falló la traducción física
+            // If it returned 0, read the Extent Header to figure out why the physical translation failed.
             let header_ptr = self.inode.i_block.as_ptr() as *const crate::fs::ext4::extents::Ext4ExtentHeader;
             let magic = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*header_ptr).eh_magic)) };
-            crate::serial_println!("[EXT4-DEBUG] ERROR FATAL: No se leyeron datos. Extent Magic: {:#06x} (Se esperaba 0xf30a).", magic);
-            return None; 
+            crate::serial_println!("[EXT4-DEBUG] FATAL ERROR: No data was read. Extent Magic: {:#06x} (expected 0xf30a).", magic);
+            return None;
         }
 
         let mut local_offset = 0;
         while local_offset < bytes_read {
-            let entry_ptr = unsafe { 
-                buffer.as_ptr().add(local_offset) as *const Ext4DirEntryHeader 
+            let entry_ptr = unsafe {
+                buffer.as_ptr().add(local_offset) as *const Ext4DirEntryHeader
             };
             let entry = unsafe { &*entry_ptr };
 
-            // Copiar campos a variables locales para evitar problemas de alineación
+            // Copy fields into local variables to avoid alignment problems.
             let rec_len = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(entry.rec_len)) } as usize;
             let inode = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(entry.inode)) };
             let name_len = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(entry.name_len)) } as usize;
 
             if rec_len == 0 {
-                crate::serial_println!("[EXT4-DEBUG] -> Bucle roto preventivamente: rec_len es 0 en offset {}", local_offset);
+                crate::serial_println!("[EXT4-DEBUG] -> Loop broken preventively: rec_len is 0 at offset {}", local_offset);
                 break;
             }
 
             if inode != 0 {
-                // Seguridad contra desbordamiento de memoria por corrupción de disco
+                // Safety against memory overflow caused by disk corruption.
                 if local_offset + 8 + name_len > bytes_read {
-                    crate::serial_println!("[EXT4-DEBUG] -> ADVERTENCIA: Entrada desbordada en offset {}", local_offset);
+                    crate::serial_println!("[EXT4-DEBUG] -> WARNING: Entry overflow at offset {}", local_offset);
                     break;
                 }
 
-                let name_ptr = unsafe { 
-                    buffer.as_ptr().add(local_offset + core::mem::size_of::<Ext4DirEntryHeader>()) 
+                let name_ptr = unsafe {
+                    buffer.as_ptr().add(local_offset + core::mem::size_of::<Ext4DirEntryHeader>())
                 };
                 let name_slice = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
 
                 if let Ok(entry_name) = core::str::from_utf8(name_slice) {
-                    // Sonda 3: Imprimimos CADA archivo que el kernel logre ver en el disco
-                    crate::serial_println!("[EXT4-DEBUG] -> Visto en disco: '{}' (Inodo: {}, Offset: {})", entry_name, inode, local_offset);
-                    
+                    // Probe 3: Print EVERY file the kernel can see on disk.
+                    crate::serial_println!("[EXT4-DEBUG] -> Seen on disk: '{}' (Inode: {}, Offset: {})", entry_name, inode, local_offset);
+
                     if entry_name == name {
-                        crate::serial_println!("[EXT4-DEBUG] -> ¡COINCIDENCIA! Solicitando Inodo {} al driver AHCI...", inode);
+                        crate::serial_println!("[EXT4-DEBUG] -> MATCH! Requesting Inode {} from the AHCI driver...", inode);
                         if let Ok(child_inode) = self.volume.read_inode(inode) {
-                            crate::serial_println!("[EXT4-DEBUG] -> Inodo {} cargado exitosamente en RAM.", inode);
+                            crate::serial_println!("[EXT4-DEBUG] -> Inode {} successfully loaded into RAM.", inode);
                             return Some(Arc::new(Ext4Node {
                                 volume: self.volume.clone(),
                                 inode_num: inode,
@@ -220,7 +223,7 @@ impl VNode for Ext4Node {
                                 size: child_inode.size() as usize,
                             }));
                         } else {
-                            crate::serial_println!("[EXT4-DEBUG] -> ERROR: volume.read_inode({}) falló.", inode);
+                            crate::serial_println!("[EXT4-DEBUG] -> ERROR: volume.read_inode({}) failed.", inode);
                         }
                     }
                 }
@@ -228,11 +231,11 @@ impl VNode for Ext4Node {
 
             local_offset += rec_len;
         }
-        
+
         None
     }
 
-    /// Lee bytes crudos del disco hacia la memoria usando el Árbol de Extents
+    /// Reads raw bytes from the disk into memory using the Extent Tree.
     fn read(&self, offset: usize, buf: &mut [u8]) -> usize {
         if offset >= self.size || buf.is_empty() { 
         return 0; 
